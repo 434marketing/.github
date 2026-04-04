@@ -1,0 +1,13 @@
+name: Deploy to WP Engine Staging
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  deploy:
+    uses: 434marketing/.github/.github/workflows/wpe-deploy-staging.yml@main
+    with:
+      theme_path: themes/THEME_NAME/
+      remote_path: wp-content/themes/THEME_NAME/
+    secrets: inherit

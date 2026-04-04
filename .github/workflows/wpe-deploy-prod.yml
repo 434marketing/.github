@@ -1,0 +1,98 @@
+name: WP Engine Production Deploy
+
+on:
+  workflow_call:
+    inputs:
+      theme_path:
+        description: "Source path within repo root (e.g. themes/my-theme/)"
+        required: true
+        type: string
+      remote_path:
+        description: "Remote path on WP Engine (e.g. wp-content/themes/my-theme/)"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Backup WP Engine Production
+        run: |
+          curl -X POST "https://api.wpengineapi.com/v1/installs/${{ secrets.WPE_INSTALL_ID }}/backups" \
+            -u "${{ secrets.WPE_API_USER_ID }}:${{ secrets.WPE_API_PASSWORD }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "description": "Pre-deploy backup (${{ github.event.pull_request.title }})",
+              "notification_emails": ["ascharf@434marketing.com"]
+            }'
+
+      - name: Deploy to WP Engine Production
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ vars.WPE_PROD_ENV }}
+          REMOTE_PATH: ${{ inputs.remote_path }}
+          SRC_PATH: ${{ inputs.theme_path }}
+          PHP_LINT: TRUE
+          FLAGS: -azvr --inplace --delete --exclude=.* --exclude=node_modules
+          CACHE_CLEAR: TRUE
+
+      - name: Determine bump type from PR labels
+        id: bump
+        run: |
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"major"'; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -q '"minor"'; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          else
+            echo "type=patch" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Calculate new version
+        id: version
+        run: |
+          CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          CURRENT="${CURRENT#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          BUMP="${{ steps.bump.outputs.type }}"
+          if [ "$BUMP" = "major" ]; then
+            MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+          elif [ "$BUMP" = "minor" ]; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+          echo "new_tag=v$MAJOR.$MINOR.$PATCH" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.new_tag }}
+          git push origin ${{ steps.version.outputs.new_tag }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_tag }}
+          name: ${{ steps.version.outputs.new_tag }}
+          generate_release_notes: true
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"text\": \":rotating_light: *Prod deploy failed* — <${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}> @ \`${{ github.sha }}\`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>\"}"
+          fi
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
