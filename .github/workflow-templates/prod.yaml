@@ -1,0 +1,19 @@
+name: Deploy to WP Engine Production
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - $default-branch
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true
+    uses: 434marketing/.github/.github/workflows/wpe-deploy-prod.yml@main
+    with:
+      theme_path: themes/THEME_NAME/
+      remote_path: wp-content/themes/THEME_NAME/
+    secrets: inherit

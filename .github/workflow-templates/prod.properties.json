@@ -1,0 +1,6 @@
+{
+  "name": "WP Engine Production Deploy",
+  "description": "Backs up and deploys the theme to WP Engine production on PR merge, then creates a versioned GitHub release. Requires WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID, WPE_API_PASSWORD, WPE_INSTALL_ID secrets and WPE_PROD_ENV variable. Optionally uses SLACK_WEBHOOK_URL for failure alerts.",
+  "iconName": "octicon-rocket",
+  "categories": ["Deployment"]
+}

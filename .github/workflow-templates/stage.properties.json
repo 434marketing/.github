@@ -1,0 +1,6 @@
+{
+  "name": "WP Engine Staging Deploy",
+  "description": "Deploys the theme to WP Engine staging on every pull request. Requires WPE_SSHG_KEY_PRIVATE secret and WPE_STAGE_ENV variable.",
+  "iconName": "octicon-rocket",
+  "categories": ["Deployment"]
+}
