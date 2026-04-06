@@ -30,7 +30,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "description": "Pre-deploy backup (${{ github.event.pull_request.title }})",
-              "notification_emails": ["${{ vars.BACKUP_EMAIL_NOTIFICATION }}"]
+              "notification_emails": ["${{ vars.BACKUP_NOTIFICATION_EMAIL }}"]
             }'
 
       - name: Deploy to WP Engine Production
