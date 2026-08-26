@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps the actions used inside the reusable workflows current
+  # (actions/checkout, softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
+  # A bump here reaches every site on @v1, so review these PRs like any other change.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "patch"
