@@ -41,7 +41,17 @@ jobs:
           REMOTE_PATH: ${{ inputs.remote_path }}
           SRC_PATH: ${{ inputs.theme_path }}
           PHP_LINT: TRUE
-          FLAGS: -azvr --inplace --delete --exclude=.* --exclude=node_modules
+          FLAGS: >-
+            -azvr --inplace --delete
+            --exclude=.*
+            --exclude=node_modules
+            --exclude=package.json
+            --exclude=package-lock.json
+            --exclude=yarn.lock
+            --exclude=vite.config.js
+            --exclude=webpack.mix.js
+            --exclude=gulpfile.js
+            --exclude=postcss.config.js
           CACHE_CLEAR: TRUE
 
       - name: Determine bump type from PR labels
