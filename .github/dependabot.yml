@@ -8,6 +8,16 @@ updates:
     schedule:
       interval: "weekly"
     commit-message:
-      prefix: "chore(deps)"
-    labels:
-      - "patch"
+      # `fix`, not `chore`. release-please only cuts a version for `feat`, `fix`
+      # and breaking changes -- a `chore(deps)` bump would land on `main`,
+      # change what every site executes, and produce no release and no
+      # changelog entry. These bumps genuinely do ship, so they are a PATCH.
+      #
+      # A bump that changes THIS repo's interface for callers (a new required
+      # secret, a renamed input) is still a MAJOR, and needs a human to retitle
+      # the PR `fix(deps)!:` before merging. Dependabot cannot know that.
+      prefix: "fix(deps)"
+    # No `labels:` here on purpose. Versioning in this repo is driven by the
+    # commit message, not by labels -- see .github/workflows/release-please.yml.
+    # The major/minor/patch labels drive wpe-deploy-prod.yml in SITE repos, and
+    # leaving one on a PR here would only suggest it does something.

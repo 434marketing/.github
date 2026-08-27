@@ -1,16 +1,40 @@
 name: Update major version tag
 
-# When a release tag like v1.2.3 is pushed, force-move the floating `v1` tag to it.
-# Sites reference @v1 by default, so this is what actually delivers a release to them.
+# Force-move the floating `v1` tag to a release tag like v1.2.3.
+# Sites reference @v1 by default, so this is what actually delivers a release
+# to them. A forgotten force-push leaves @v1 on a stale commit and the release
+# reaches nobody -- that is the failure mode this exists to prevent.
 #
-# Doing this by hand is the failure mode this exists to prevent: a forgotten
-# force-push leaves @v1 pointing at a stale commit and the release reaches nobody.
+# THREE ENTRY POINTS, one implementation:
+#
+#   workflow_call   The normal path. release-please.yml calls this right after
+#                   it cuts a release. It has to call rather than rely on the
+#                   `push` trigger below, because a tag created with
+#                   GITHUB_TOKEN does not trigger other workflows.
+#   push (tags)     Fallback for a tag pushed by hand from a laptop, which does
+#                   trigger workflows.
+#   workflow_dispatch  Repair. Use it if `v1` ever ends up pointing at the
+#                   wrong commit; pass the vX.Y.Z tag it should point at.
+#
+# The operation is idempotent -- it is safe if two paths fire for the same tag.
 
 on:
   push:
     tags:
       # Deliberately excludes pre-releases (v1.2.3-beta.1 will not match).
       - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to point v<major> at (e.g. v1.2.3)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to point v<major> at (e.g. v1.2.3)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,9 +48,32 @@ jobs:
           fetch-depth: 0
 
       - name: Move v<major> to this release
+        env:
+          # `inputs` is empty on the push path, where the tag is the ref itself.
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+
+          # Guard the dispatch and call paths: github.ref_name is `main` when
+          # this is called from release-please.yml, so a missing or malformed
+          # input must fail loudly rather than tag `v1` at `main`.
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error title=Not a release tag::Refusing to act on '$TAG'. Expected a vX.Y.Z tag."
+              exit 1
+              ;;
+          esac
+
+          # release-please creates the tag through the API moments earlier, so
+          # make sure this checkout has it before pointing anything at it.
+          git fetch --force --tags origin
+
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error title=Tag not found::'$TAG' does not exist in this repository."
+            exit 1
+          fi
+
           MAJOR="${TAG%%.*}"          # v1.2.3 -> v1
 
           git config user.name  "github-actions[bot]"
@@ -35,6 +82,8 @@ jobs:
           git tag -f "$MAJOR" "$TAG"
           git push -f origin "refs/tags/$MAJOR"
 
-          echo "### Moved \`$MAJOR\` → \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Every site referencing \`@$MAJOR\` picks this up on its next deploy." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Moved \`$MAJOR\` → \`$TAG\`"
+            echo ""
+            echo "Every site referencing \`@$MAJOR\` picks this up on its next deploy."
+          } >> "$GITHUB_STEP_SUMMARY"

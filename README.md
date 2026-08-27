@@ -35,7 +35,9 @@ Backs up and deploys a WordPress theme to WP Engine production on PR merge. Crea
 
 **Optional secret:** `SLACK_WEBHOOK_URL` — if present, sends a Slack alert on failure
 
-**Versioning:** reads PR labels (`major`, `minor`, `patch`) to determine the semver bump. Defaults to `patch`.
+**Versioning:** tags and releases **the calling site's repo**, reading that PR's labels
+(`major`, `minor`, `patch`) to determine the semver bump. Defaults to `patch`. This is unrelated
+to how *this* repo is versioned — see [Versioning](#versioning) below.
 
 ## Using These Workflows
 
@@ -77,16 +79,60 @@ tag — but it means the bar for MAJOR is *"could this break a site that works t
 
 ### Cutting a release
 
-1. Merge to `main` (requires a PR and one approval).
-2. Tag it and push:
-   ```bash
-   git tag v1.1.0 && git push origin v1.1.0
-   ```
-3. [`update-major-tag.yml`](.github/workflows/update-major-tag.yml) force-moves `v1` to that
-   commit automatically. **This is the step that actually delivers the release** — every site
-   on `@v1` picks it up on its next deploy.
-4. Publish a GitHub Release with notes. Site owners read these to decide whether they need to
-   pin away from `@v1`.
+Releases are automatic. You never tag this repo by hand.
+
+[`release-please.yml`](.github/workflows/release-please.yml) runs on every push to `main` and
+keeps **one open Release PR** that accumulates the pending changes and shows the version they
+will cut. Merging that PR is the act of releasing: it writes `CHANGELOG.md`, bumps
+[`.github/VERSION`](.github/VERSION), creates the `vX.Y.Z` tag and the GitHub Release, and then
+force-moves `v1` to it.
+
+So the whole procedure is:
+
+1. Merge a PR into `main` with a **conventional commit title** (see below).
+2. Merge the Release PR when you want to ship. Everything else happens on its own.
+
+`main` allows squash and rebase merges only, and squash is the normal path — which means the
+**PR title becomes the commit message**, and that title is the only thing release-please reads.
+[`pr-title-lint.yml`](.github/workflows/pr-title-lint.yml) rejects a PR whose title will not
+parse, and its check summary tells you which bump the title is about to cause.
+
+#### Writing the title
+
+| Title | Bump | Reaches `@v1` sites |
+|---|---|---|
+| `fix: correct the rsync exclude for lockfiles` | PATCH → `v1.1.1` | Automatically |
+| `feat: add an optional php_lint input` | MINOR → `v1.2.0` | Automatically |
+| `feat!: require a WPE_INSTALL_ID secret` | MAJOR → `v2.0.0` | **Never** — each site must update its `uses:` line |
+| `docs:`, `ci:`, `chore:`, `build:`, `test:`, `style:` | None | n/a |
+
+A `!` before the colon, or a `BREAKING CHANGE:` footer, is what cuts a major. Use the test from
+[What counts as a breaking change](#what-counts-as-a-breaking-change): *could this break a site
+that works today* — not *does this feel big*.
+
+Types that cut no version still appear in the changelog of the next release that does — except
+`chore`, `ci`, `build`, `test` and `style`, which are hidden. A PR that changes only docs or CI
+correctly produces no release at all.
+
+#### If something goes wrong
+
+- **No Release PR appeared.** Nothing releasable landed. Check the workflow's run summary; the
+  usual cause is a `chore:` title on a change that deserved `fix:`.
+- **`v1` points at the wrong commit.** Run
+  [`update-major-tag.yml`](.github/workflows/update-major-tag.yml) via *Actions → Run workflow*
+  and give it the `vX.Y.Z` tag `v1` should point at.
+- **A version needs to be forced.** Add a `Release-As: 1.4.0` footer to a commit on `main`.
+
+#### Configuration
+
+| File | Purpose |
+|---|---|
+| [`.github/release-please-config.json`](.github/release-please-config.json) | Bump rules and changelog sections |
+| [`.github/.release-please-manifest.json`](.github/.release-please-manifest.json) | Current version — **release-please owns this, do not hand-edit** |
+| [`.github/VERSION`](.github/VERSION) | Same version as plain text, for humans and greps |
+
+`last-release-sha` in the config pins the start of history to the `v1.1.0` commit, so the
+pre-automation commits (`Initial commit`, `Update Readme`, …) are never scanned. Leave it.
 
 ### Migrating to a new major
 
