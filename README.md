@@ -147,16 +147,47 @@ is wrong — the squash commit takes the title, so this is the only edit needed.
 | MINOR | `feat(deps): …` | The only way — see below |
 
 There is no `deps`-flavoured minor. Only the literal types `feat` and `feature` produce one
-(`versioning-strategies/default.ts`), and no config option changes that. The other escape hatch,
-a `Release-As: 1.2.0` footer, is awkward here: this repo's `squash_merge_commit_message` is
-`COMMIT_MESSAGES`, so the PR *description* never reaches the commit — you would have to edit the
-body in the squash-merge dialog.
+(`versioning-strategies/default.ts`), and no config option changes that. The other escape hatch is
+a `Release-As:` footer in the PR description, which forces an exact version and is checked before
+anything else.
 
 In practice MINOR is close to an empty category for a pure dependency bump. A bump on its own
 adds no input, secret or capability to *this* repo's interface, so it is a PATCH; if it could
 break a site it is a MAJOR. It is only a MINOR when you also changed a workflow to expose
 something the new version made possible — and that is your own `feat:` PR, with the bump riding
 along in it.
+
+### The PR description is part of the commit message
+
+This repo squash-merges with **"Pull request title and description"**, so the description you
+write becomes the body of the commit on `main` — and release-please parses that body, not just
+the title.
+
+That is what makes the `Release-As:` footer above work. It also means a PR description can
+accidentally create a **phantom commit**. release-please splits one commit message into several
+wherever a blank line is immediately followed by a conventional-commit prefix
+([`commit.ts`](https://github.com/googleapis/release-please/blob/main/src/commit.ts),
+`splitMessages`):
+
+```
+feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert
+```
+
+So in a repo whose pull requests are frequently *about* versioning, a description like this one
+cuts a MINOR from a docs-only PR, because the second paragraph parses as a real commit:
+
+<pre>
+Explains the release types.
+
+feat: add an optional php_lint input
+</pre>
+
+The rule is narrow and easy to live with: **never start a paragraph with `type: `.** Keep every
+example inside a fenced code block, a table cell, or inline backticks — a fence works because the
+line above it is not blank. The same applies to a `BREAKING CHANGE:` footer, which cuts a MAJOR
+from any PR whose description mentions one at the start of a line.
+
+Note that `deps` is *not* in the split list, so a `deps: …` example in a description is harmless.
 
 #### If something goes wrong
 
