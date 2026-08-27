@@ -1,0 +1,86 @@
+name: Lint PR title
+
+# `main` allows squash and rebase merges only, and squash is the normal path --
+# which means the PR TITLE becomes the commit message on `main`, and that commit
+# message is the only thing release-please reads to decide the next version.
+#
+# A title like "Update the deploy workflow" parses as nothing, cuts no release,
+# and appears in no changelog. That is a silent failure, so it is gated here.
+#
+# NOTE: this only guards the squash path. If you rebase-merge instead, every
+# individual commit message on the branch is what release-please sees, and this
+# check says nothing about them.
+#
+# Delete this file if you would rather not gate PRs; release-please works
+# without it, just less predictably.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-title:
+    name: Title must be a conventional commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title
+        env:
+          # Via env, never inline in the script: a PR title is untrusted input.
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          PATTERN='^(feat|fix|deps|perf|refactor|revert|docs|chore|ci|build|test|style)(\([a-z0-9._/-]+\))?!?: .+'
+
+          if ! printf '%s' "$TITLE" | grep -Eq "$PATTERN"; then
+            echo "::error title=PR title is not a conventional commit::'$TITLE'"
+            {
+              echo "### PR title is not a conventional commit"
+              echo ""
+              echo "Got: \`$TITLE\`"
+              echo ""
+              echo "Expected \`type(optional-scope): description\`, for example:"
+              echo ""
+              echo '```'
+              echo "feat: add a php_lint input to the prod deploy workflow"
+              echo "fix(deps): bump actions/checkout from 6 to 7"
+              echo "feat!: require a WPE_INSTALL_ID secret"
+              echo '```'
+              echo ""
+              echo "Types: feat, fix, deps, perf, refactor, revert, docs, chore, ci, build, test, style."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          TYPE="${TITLE%%[(:!]*}"
+
+          {
+            echo "### PR title OK"
+            echo ""
+            echo "\`$TITLE\`"
+            echo ""
+            # release-please releases a type if that type is VISIBLE in
+            # changelog-sections; a hidden type produces empty release notes and
+            # no release. Keep this list in step with .github/release-please-config.json.
+            case "$TITLE" in
+              *'!:'*)
+                echo "This is a **breaking change** — it will cut a new MAJOR (\`v2\`)."
+                echo ""
+                echo "Sites on \`@v1\` will NOT receive it until each one's \`uses:\` line is updated by hand. Make sure that is what you mean."
+                ;;
+              feat*)
+                echo "Cuts a **MINOR**. Every site on \`@v1\` picks it up automatically."
+                ;;
+              chore*|ci*|build*|test*|style*)
+                echo "\`$TYPE\` is a hidden type: this cuts **no release**, and will not appear in any changelog."
+                echo ""
+                echo "If this change alters what the shared workflows actually do, retitle it \`fix:\` or \`feat:\` — otherwise it sits on \`main\` and never reaches a site."
+                ;;
+              *)
+                echo "Cuts a **PATCH**. Every site on \`@v1\` picks it up automatically."
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"

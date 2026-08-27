@@ -2,12 +2,28 @@ version: 2
 updates:
   # Keeps the actions used inside the reusable workflows current
   # (actions/checkout, softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
-  # A bump here reaches every site on @v1, so review these PRs like any other change.
+  # A bump here reaches every site on @v1 once it is released, so review these
+  # PRs like any other change.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
-      prefix: "chore(deps)"
-    labels:
-      - "patch"
+      # `deps`, not `chore`. release-please treats a type as releasable if that
+      # type is VISIBLE in `changelog-sections` -- a hidden type produces empty
+      # release notes and no release at all. `chore` is hidden here on purpose
+      # (a comment tidy-up should not move `v1` for every site), so a
+      # `chore(deps)` bump would sit on main undelivered and unlogged until some
+      # unrelated change happened to cut a release.
+      #
+      # `deps` is visible, so a bump cuts a PATCH on its own, and release-please
+      # has a built-in "Dependencies" heading for it.
+      #
+      # A bump that changes THIS repo's interface for callers (a new required
+      # secret, a renamed input) is still a MAJOR, and needs a human to retitle
+      # the PR `deps!:` before merging. Dependabot cannot know that.
+      prefix: "deps"
+    # No `labels:` here on purpose. Versioning in this repo is driven by the
+    # commit message, not by labels -- see .github/workflows/release-please.yml.
+    # The major/minor/patch labels drive wpe-deploy-prod.yml in SITE repos, and
+    # leaving one on a PR here would only suggest it does something.

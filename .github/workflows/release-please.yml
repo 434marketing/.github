@@ -1,0 +1,100 @@
+name: Release Please
+
+# Auto-versioning for the shared workflows. Runs on every push to `main` and
+# keeps ONE open "Release PR" that accumulates pending changes and shows the
+# version they will cut. Merging that PR is the act of releasing: it writes
+# CHANGELOG.md, bumps .github/VERSION and the manifest, and creates the tag and
+# GitHub Release.
+#
+# Creating the tag is NOT the same as delivering the release. Sites reference
+# @v1, so the floating major tag has to move too -- that is the second job.
+#
+# WHY THE SECOND JOB EXISTS, instead of letting update-major-tag.yml's `push:
+# tags:` trigger catch it: a tag created with GITHUB_TOKEN does not trigger
+# other workflows. If we relied on the trigger, release-please would cut v1.2.0,
+# `v1` would stay on v1.1.0, and the release would reach nobody -- exactly the
+# failure mode update-major-tag.yml was written to prevent, reintroduced
+# silently. So this workflow calls that one directly.
+#
+# TOKEN CHOICE -- read this before changing it.
+# As verified on 2026-08-27 this repo has `can_approve_pull_request_reviews:
+# true` (Settings -> Actions -> General -> "Allow GitHub Actions to create and
+# approve pull requests"), so the built-in GITHUB_TOKEN can open the Release PR
+# and no PAT is needed. Keep it that way if you can: the org's "Vendor Gate"
+# ruleset requires one approving review on `main`, and a PR opened by
+# github-actions[bot] is a PR *you* are allowed to approve. Switch to a PAT and
+# the Release PR becomes your own PR, which you cannot approve yourself.
+# If that setting is ever turned off, add a fine-grained PAT with
+# Contents: read/write + Pull requests: read/write and use it here.
+
+on:
+  push:
+    branches: [main]
+
+# Repo default workflow permission is `read`, so these are required.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain the Release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+    steps:
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+      - name: Explain a permissions failure
+        if: failure()
+        run: |
+          echo "::error title=release-please failed::If the log says GitHub Actions is not permitted to create or approve pull requests, enable that setting in Settings -> Actions -> General, or supply a PAT. See the comment at the top of this workflow file."
+
+      - name: Summary
+        if: success()
+        env:
+          RELEASED: ${{ steps.release.outputs.release_created }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          PRS: ${{ steps.release.outputs.prs_created }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Release Please"
+            echo ""
+            if [ "${RELEASED}" = "true" ]; then
+              echo "Cut release **${TAG}**. The \`v<major>\` tag is being moved to it now."
+              echo ""
+              echo "Every site referencing \`@v1\` picks this up on its next deploy."
+            elif [ "${PRS}" = "true" ]; then
+              echo "Release PR opened or updated. Merge it when you want to cut the version."
+            else
+              echo "No releasable changes on this push."
+              echo ""
+              echo "Only \`feat\`, \`fix\`, and breaking changes (\`!\` or a \`BREAKING CHANGE:\` footer) cut a version. \`chore\`, \`ci\`, \`docs\`, \`build\`, \`test\` and \`style\` do not."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Delivery. Without this the tag exists and nothing reaches any site.
+  move-major-tag:
+    name: Move v<major> to the new release
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/update-major-tag.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
