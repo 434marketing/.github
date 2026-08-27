@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          PATTERN='^(feat|fix|perf|refactor|docs|chore|ci|build|test|style|revert)(\([a-z0-9._/-]+\))?!?: .+'
+          PATTERN='^(feat|fix|deps|perf|refactor|revert|docs|chore|ci|build|test|style)(\([a-z0-9._/-]+\))?!?: .+'
 
           if ! printf '%s' "$TITLE" | grep -Eq "$PATTERN"; then
             echo "::error title=PR title is not a conventional commit::'$TITLE'"
@@ -50,7 +50,7 @@ jobs:
               echo "feat!: require a WPE_INSTALL_ID secret"
               echo '```'
               echo ""
-              echo "Types: feat, fix, perf, refactor, docs, chore, ci, build, test, style, revert."
+              echo "Types: feat, fix, deps, perf, refactor, revert, docs, chore, ci, build, test, style."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -62,14 +62,25 @@ jobs:
             echo ""
             echo "\`$TITLE\`"
             echo ""
+            # release-please releases a type if that type is VISIBLE in
+            # changelog-sections; a hidden type produces empty release notes and
+            # no release. Keep this list in step with .github/release-please-config.json.
             case "$TITLE" in
               *'!:'*)
                 echo "This is a **breaking change** — it will cut a new MAJOR (\`v2\`)."
                 echo ""
                 echo "Sites on \`@v1\` will NOT receive it until each one's \`uses:\` line is updated by hand. Make sure that is what you mean."
                 ;;
-              feat*) echo "Cuts a **MINOR**. Every site on \`@v1\` picks it up automatically." ;;
-              fix*)  echo "Cuts a **PATCH**. Every site on \`@v1\` picks it up automatically." ;;
-              *)     echo "\`$TYPE\` does **not** cut a release on its own. It will ride along in the changelog of the next \`feat\` or \`fix\`." ;;
+              feat*)
+                echo "Cuts a **MINOR**. Every site on \`@v1\` picks it up automatically."
+                ;;
+              chore*|ci*|build*|test*|style*)
+                echo "\`$TYPE\` is a hidden type: this cuts **no release**, and will not appear in any changelog."
+                echo ""
+                echo "If this change alters what the shared workflows actually do, retitle it \`fix:\` or \`feat:\` — otherwise it sits on \`main\` and never reaches a site."
+                ;;
+              *)
+                echo "Cuts a **PATCH**. Every site on \`@v1\` picks it up automatically."
+                ;;
             esac
           } >> "$GITHUB_STEP_SUMMARY"

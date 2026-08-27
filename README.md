@@ -101,23 +101,40 @@ parse, and its check summary tells you which bump the title is about to cause.
 
 | Title | Bump | Reaches `@v1` sites |
 |---|---|---|
-| `fix: correct the rsync exclude for lockfiles` | PATCH → `v1.1.1` | Automatically |
-| `feat: add an optional php_lint input` | MINOR → `v1.2.0` | Automatically |
 | `feat!: require a WPE_INSTALL_ID secret` | MAJOR → `v2.0.0` | **Never** — each site must update its `uses:` line |
-| `docs:`, `ci:`, `chore:`, `build:`, `test:`, `style:` | None | n/a |
+| `feat: add an optional php_lint input` | MINOR → `v1.2.0` | Automatically |
+| `fix: correct the rsync exclude for lockfiles` | PATCH → `v1.1.1` | Automatically |
+| `deps: bump actions/checkout from 6 to 7` | PATCH | Automatically |
+| `docs:`, `perf:`, `refactor:`, `revert:` | PATCH | Automatically |
+| `chore:`, `ci:`, `build:`, `test:`, `style:` | **None** | Never — the change sits on `main` |
 
 A `!` before the colon, or a `BREAKING CHANGE:` footer, is what cuts a major. Use the test from
 [What counts as a breaking change](#what-counts-as-a-breaking-change): *could this break a site
 that works today* — not *does this feel big*.
 
-Types that cut no version still appear in the changelog of the next release that does — except
-`chore`, `ci`, `build`, `test` and `style`, which are hidden. A PR that changes only docs or CI
-correctly produces no release at all.
+#### Which types release, and why
+
+release-please's rule is not "only `feat` and `fix` release." It is: **a type releases if that
+type is visible in `changelog-sections`.** A window of commits whose types are all hidden
+generates empty release notes, and release-please skips the release entirely
+([`base.ts`](https://github.com/googleapis/release-please/blob/main/src/strategies/base.ts) —
+`changelogEmpty`). Anything visible that is not `feat` and not breaking falls through to a
+patch.
+
+So the hidden list in [`.github/release-please-config.json`](.github/release-please-config.json)
+*is* the release policy. It is set so that **`v1` moves when what executes or what is documented
+changes**, and not otherwise. `chore` is deliberately hidden: tidying a comment should not push a
+new version at every 434 site.
+
+The trap is the flip side — a real behaviour change titled `chore:` cuts no release, appears in no
+changelog, and sits on `main` reaching nobody. `pr-title-lint.yml` calls that out on the PR, but it
+cannot read your mind. If a change alters what the workflows *do*, it is a `fix:` or a `feat:`.
 
 #### If something goes wrong
 
-- **No Release PR appeared.** Nothing releasable landed. Check the workflow's run summary; the
-  usual cause is a `chore:` title on a change that deserved `fix:`.
+- **No Release PR appeared.** Every commit since the last release is a hidden type. Check the
+  workflow's run summary; the usual cause is a `chore:` or `ci:` title on a change that deserved
+  `fix:`. Fix it by landing the next change with a releasing type, or force one with `Release-As:`.
 - **`v1` points at the wrong commit.** Run
   [`update-major-tag.yml`](.github/workflows/update-major-tag.yml) via *Actions → Run workflow*
   and give it the `vX.Y.Z` tag `v1` should point at.

@@ -13,8 +13,10 @@
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
         { "type": "fix", "section": "Bug Fixes" },
+        { "type": "deps", "section": "Dependencies" },
         { "type": "perf", "section": "Performance" },
         { "type": "refactor", "section": "Refactors" },
+        { "type": "revert", "section": "Reverts" },
         { "type": "docs", "section": "Documentation" },
         { "type": "chore", "section": "Chores", "hidden": true },
         { "type": "ci", "section": "CI", "hidden": true },
