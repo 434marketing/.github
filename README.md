@@ -130,6 +130,34 @@ The trap is the flip side — a real behaviour change titled `chore:` cuts no re
 changelog, and sits on `main` reaching nobody. `pr-title-lint.yml` calls that out on the PR, but it
 cannot read your mind. If a change alters what the workflows *do*, it is a `fix:` or a `feat:`.
 
+One exception to "hidden never releases": a **breaking marker overrides the hidden list**.
+`determineReleaseType` checks `commit.breaking` *before* it looks at the type, and the
+BREAKING CHANGES section of the changelog is built from commit notes rather than from the type
+sections. So `chore!: …` cuts a MAJOR, hidden or not.
+
+#### Re-titling a dependabot PR
+
+Dependabot always proposes `deps:`, which is a patch. Change the PR title before merging if that
+is wrong — the squash commit takes the title, so this is the only edit needed.
+
+| You want | Retitle to | Notes |
+|---|---|---|
+| PATCH | *(leave it)* | The default, and correct for almost every bump |
+| MAJOR | `deps!: …` or `deps(github-actions)!: …` | `!` goes **after** the scope, before the colon. `deps!(): …` is not valid and the lint rejects it |
+| MINOR | `feat(deps): …` | The only way — see below |
+
+There is no `deps`-flavoured minor. Only the literal types `feat` and `feature` produce one
+(`versioning-strategies/default.ts`), and no config option changes that. The other escape hatch,
+a `Release-As: 1.2.0` footer, is awkward here: this repo's `squash_merge_commit_message` is
+`COMMIT_MESSAGES`, so the PR *description* never reaches the commit — you would have to edit the
+body in the squash-merge dialog.
+
+In practice MINOR is close to an empty category for a pure dependency bump. A bump on its own
+adds no input, secret or capability to *this* repo's interface, so it is a PATCH; if it could
+break a site it is a MAJOR. It is only a MINOR when you also changed a workflow to expose
+something the new version made possible — and that is your own `feat:` PR, with the bump riding
+along in it.
+
 #### If something goes wrong
 
 - **No Release PR appeared.** Every commit since the last release is a hidden type. Check the
