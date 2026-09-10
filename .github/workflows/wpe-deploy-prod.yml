@@ -24,14 +24,36 @@ jobs:
           fetch-depth: 0
 
       - name: Backup WP Engine Production
+        # Every value below reaches the script through `env`, never inlined into
+        # it. A PR title is untrusted input: `${{ }}` is substituted textually
+        # BEFORE bash parses the script, so an inlined title containing an
+        # apostrophe closes the quoted JSON payload and the remainder is parsed
+        # as shell. That broke a real deploy (title: "... the `location` CPT's
+        # rewrite rules" -> syntax error near unexpected token `)'), and a title
+        # crafted with $(...) after an apostrophe would have executed against a
+        # runner holding the WPE SSH key and API credentials.
+        #
+        # Same rule pr-title-lint.yml already follows. jq builds the JSON so the
+        # title is escaped as data rather than concatenated into it.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BACKUP_EMAIL: ${{ vars.BACKUP_NOTIFICATION_EMAIL }}
+          WPE_INSTALL_ID: ${{ secrets.WPE_INSTALL_ID }}
+          WPE_API_USER_ID: ${{ secrets.WPE_API_USER_ID }}
+          WPE_API_PASSWORD: ${{ secrets.WPE_API_PASSWORD }}
         run: |
-          curl -X POST "https://api.wpengineapi.com/v1/installs/${{ secrets.WPE_INSTALL_ID }}/backups" \
-            -u "${{ secrets.WPE_API_USER_ID }}:${{ secrets.WPE_API_PASSWORD }}" \
+          set -euo pipefail
+
+          payload=$(jq -n \
+            --arg desc "Pre-deploy backup (${PR_TITLE})" \
+            --arg email "${BACKUP_EMAIL}" \
+            '{description: $desc, notification_emails: [$email]}')
+
+          curl -sS --fail-with-body -X POST \
+            "https://api.wpengineapi.com/v1/installs/${WPE_INSTALL_ID}/backups" \
+            -u "${WPE_API_USER_ID}:${WPE_API_PASSWORD}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "description": "Pre-deploy backup (${{ github.event.pull_request.title }})",
-              "notification_emails": ["${{ vars.BACKUP_NOTIFICATION_EMAIL }}"]
-            }'
+            -d "$payload"
 
       - name: Deploy to WP Engine Production
         uses: wpengine/github-action-wpe-site-deploy@v3
@@ -56,8 +78,11 @@ jobs:
 
       - name: Determine bump type from PR labels
         id: bump
+        env:
+          # Via env for the same reason as the backup step: label names are
+          # user-supplied and would otherwise be inlined into the script.
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
-          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
           if echo "$LABELS" | grep -q '"major"'; then
             echo "type=major" >> $GITHUB_OUTPUT
           elif echo "$LABELS" | grep -q '"minor"'; then
