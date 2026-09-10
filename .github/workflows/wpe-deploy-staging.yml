@@ -1,5 +1,9 @@
 name: WP Engine Staging Deploy
 
+# DEPRECATED as of v2 — superseded by `wpe-deploy.yml`, which does every
+# environment from one file. This is kept so nothing pinned to `@v1` breaks.
+# See the README's migration section. Fixes still land here; features do not.
+
 on:
   workflow_call:
     inputs:
@@ -26,8 +30,18 @@ jobs:
           REMOTE_PATH: ${{ inputs.remote_path }}
           SRC_PATH: ${{ inputs.theme_path }}
           PHP_LINT: TRUE
+          # `--inplace` is deliberately ABSENT. It wrote incoming bytes straight
+          # into the live destination file; rsync's default writes a temp file in
+          # the destination directory and rename()s it over the target, which is
+          # atomic within a directory, so a request that reads a template
+          # mid-deploy gets a whole file rather than a splice of two. rsync's
+          # manual on --inplace: "The file's data will be in an inconsistent state
+          # during the transfer and will be left that way if the transfer is
+          # interrupted or if an update fails." A live WordPress theme is the
+          # textbook in-use file. --inplace also implies --partial, so an
+          # interrupted run LEAVES the broken bytes in place.
           FLAGS: >-
-            -azvr --inplace --delete
+            -azvr --delete
             --exclude=.*
             --exclude=node_modules
             --exclude=package.json
