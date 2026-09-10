@@ -1,0 +1,98 @@
+name: Release Please
+
+# VERSIONING FOR A CLIENT SITE REPO. This is the piece `prod.yaml` depends on:
+# it is what creates the vX.Y.Z tag that a production deploy triggers from.
+#
+# It runs on every push to the default branch and keeps ONE open pull request
+# titled `chore(main): release X.Y.Z`, which accumulates the pending changes and
+# shows the version they will cut. Merging that PR is the act of releasing: it
+# writes CHANGELOG.md, bumps .github/VERSION and the manifest, and creates the
+# git tag and the GitHub Release.
+#
+# NOTHING HERE DEPLOYS. It creates a tag; `prod.yaml` deploys that tag.
+#
+# BEFORE THIS WORKS, two files have to exist in the repo. Copy them from
+# `client-repo-templates/` in 434marketing/.github and edit the theme path:
+#     .github/release-please-config.json
+#     .github/.release-please-manifest.json
+#
+# AND ONE REPO SETTING: Settings -> Actions -> General -> "Allow GitHub Actions
+# to create and approve pull requests" must be ON, or GITHUB_TOKEN cannot open
+# the Release PR at all and this workflow fails with a permissions error.
+#
+# VERSION NUMBERS COME FROM COMMIT MESSAGES, NOT LABELS. With squash merging —
+# which is the normal path — the PR TITLE becomes the commit subject, so the PR
+# title is what decides the version. `feat:` cuts a minor, `fix:` a patch, a `!`
+# before the colon cuts a major, and `chore:`/`ci:`/`build:`/`test:`/`style:`
+# cut nothing at all.
+#
+# THE FIRST RELEASE IS 1.0.0, not 0.1.0. With no prior release, release-please
+# skips the bump rules entirely and returns `initial-version`, which is 1.0.0 for
+# release-type `simple`. The commits behind the first Release PR decide its
+# changelog, not its number. For a new build that suits it: merge the first
+# Release PR when the site goes live.
+
+on:
+  push:
+    branches:
+      - $default-branch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain the Release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          # The built-in GITHUB_TOKEN, deliberately, not a PAT. A PR opened by
+          # github-actions[bot] is a PR *you* are allowed to approve; switch to a
+          # PAT and the Release PR becomes your own, which you cannot approve
+          # yourself if the repo requires a review.
+          #
+          # The trade-off worth knowing: a PR opened with GITHUB_TOKEN does NOT
+          # trigger `pull_request` workflows, so dev.yaml never deploys the
+          # Release PR. That is almost always what you want — the Release PR
+          # touches CHANGELOG.md, the version file and the manifest, and there is
+          # no PHP in it.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+      - name: Explain a permissions failure
+        if: failure()
+        run: |
+          echo "::error title=release-please failed::If the log says GitHub Actions is not permitted to create or approve pull requests, enable that setting in Settings -> Actions -> General."
+
+      - name: Summary
+        if: success()
+        env:
+          RELEASED: ${{ steps.release.outputs.release_created }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          PRS: ${{ steps.release.outputs.prs_created }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Release Please"
+            echo ""
+            if [ "${RELEASED}" = "true" ]; then
+              echo "Cut release **${TAG}**. If this repo has \`prod.yaml\`, that tag is deploying to production now."
+            elif [ "${PRS}" = "true" ]; then
+              echo "Release PR opened or updated. Merge it when you want to release."
+            else
+              echo "No releasable changes on this push."
+              echo ""
+              echo "Only \`feat\`, \`fix\` and breaking changes cut a version. \`chore\`, \`ci\`, \`build\`, \`test\` and \`style\` do not — if this change alters what the site does, it wanted \`fix:\` or \`feat:\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

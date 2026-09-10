@@ -1,0 +1,6 @@
+{
+  "name": "Release Please (versioning)",
+  "description": "Keeps one open Release PR on the default branch; merging it writes the CHANGELOG, bumps the version and creates the vX.Y.Z tag that the Production Deploy workflow triggers from. Also needs .github/release-please-config.json and .github/.release-please-manifest.json — copy both from client-repo-templates/ in 434marketing/.github. Requires 'Allow GitHub Actions to create and approve pull requests' to be enabled.",
+  "iconName": "octicon-tag",
+  "categories": ["Continuous integration"]
+}

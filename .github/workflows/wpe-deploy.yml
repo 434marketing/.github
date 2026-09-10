@@ -1,0 +1,494 @@
+name: WP Engine Deploy (reusable)
+
+# ONE reusable workflow for every environment. It replaces the v1 pair
+# `wpe-deploy-staging.yml` / `wpe-deploy-prod.yml`, which differ only in
+# configuration — the install name, whether a backup is taken, and what happens
+# after the rsync. Configuration belongs in inputs, not in a second file that has
+# to be kept in step by hand.
+#
+#   jobs:
+#     deploy:
+#       uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
+#       with:
+#         wpe_env: mysitestg
+#         src_path: themes/mytheme/
+#         remote_path: wp-content/themes/mytheme/
+#         environment: staging
+#         backup: true
+#       secrets: inherit
+#
+# WHAT THIS WORKFLOW DELIBERATELY DOES NOT DO, unlike v1's prod workflow:
+# it does not tag, it does not cut a GitHub Release, and it does not read
+# `major`/`minor`/`patch` PR labels. Versioning is release-please's job in the
+# calling repo, and a deploy that also decides the version number means the
+# release cannot be reviewed before it ships. See the README.
+
+on:
+  workflow_call:
+    inputs:
+      wpe_env:
+        description: "WP Engine install NAME to deploy to, e.g. mysitestg."
+        required: true
+        type: string
+      src_path:
+        description: "Source path within the repo, e.g. themes/mytheme/. A trailing slash copies the CONTENTS of the directory; without one the directory itself is copied."
+        required: true
+        type: string
+      remote_path:
+        description: "Destination path on the install, e.g. wp-content/themes/mytheme/."
+        required: true
+        type: string
+      environment:
+        description: >-
+          GitHub Environment to attribute the deployment to — dev, staging or
+          production. Required: it is what gives you deployment history and the
+          option of a required reviewer. GitHub creates the environment on first
+          use, so there is nothing to set up first.
+        required: true
+        type: string
+      ref:
+        description: "Git ref or SHA to deploy. Defaults to the caller's ref, which is not always what you want — on a merged pull_request, pass the merge commit."
+        required: false
+        default: ""
+        type: string
+      version:
+        description: >-
+          Label to stamp on the WP Engine restore point. Optional: when empty the
+          backup is described as `<ref-name>@<short-sha>`, which is factual and
+          needs no git. This is a DESCRIPTION, never a release version — nothing
+          here computes or publishes a version number.
+        required: false
+        default: ""
+        type: string
+      backup:
+        description: "Request a WP Engine restore point before deploying."
+        required: false
+        default: false
+        type: boolean
+      backup_required:
+        description: "Fail the deploy if the restore point cannot be taken. True for production; false for staging, where a missing backup should warn rather than block."
+        required: false
+        default: false
+        type: boolean
+      backup_wait:
+        description: "Block until WP Engine reports the backup `completed`. True for production. A 202 means REQUESTED, not taken — without this the snapshot runs concurrently with the rsync."
+        required: false
+        default: false
+        type: boolean
+      lint_paths:
+        description: "Space-separated paths to `php -l` before deploying. Empty string disables the lint gate."
+        required: false
+        default: "."
+        type: string
+      php_version:
+        description: "PHP version for the lint gate. Match the install."
+        required: false
+        default: "8.2"
+        type: string
+      rsync_flags:
+        description: >-
+          rsync flags. The default ADDS --delete (the action's own default never
+          deletes, so a file removed from git lives on forever) and OMITS
+          --inplace (see the long note at the deploy step). Setting this replaces
+          the whole string, so re-state -azvr and the excludes.
+        required: false
+        default: >-
+          -azvr --delete
+          --exclude=.*
+          --exclude=node_modules
+          --exclude=package.json
+          --exclude=package-lock.json
+          --exclude=yarn.lock
+          --exclude=vite.config.js
+          --exclude=webpack.mix.js
+          --exclude=gulpfile.js
+          --exclude=postcss.config.js
+        type: string
+      cache_clear:
+        description: "Flush WP Engine page and CDN cache after the deploy."
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: "Lint and resolve the install, then stop. Nothing is backed up and nothing is written. Use it to rehearse against an install this repo has never deployed to."
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      WPE_SSHG_KEY_PRIVATE:
+        description: "Passwordless SSH private key authorized on the SSH Gateway for this install."
+        required: true
+      WPE_API_USER_ID:
+        description: "WP Engine API user id (my.wpengine.com/api_access). Only needed when backup is true."
+        required: false
+      WPE_API_PASSWORD:
+        description: "WP Engine API password. Only needed when backup is true."
+        required: false
+      SLACK_WEBHOOK_URL:
+        description: "Optional. If set, a failed deploy posts to this webhook."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. LINT — the cheap hard gate. Runs before anything touches the install, so
+  #    a syntax error never costs a backup or a half-applied rsync.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: PHP syntax lint
+    if: inputs.lint_paths != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+      - name: php -l
+        env:
+          LINT_PATHS: ${{ inputs.lint_paths }}
+        run: |
+          set -euo pipefail
+          # -print0/-0 because a path containing a space would otherwise be split
+          # into two nonexistent paths and linted as nothing — a green gate that
+          # checked no files at all.
+          # shellcheck disable=SC2086
+          find $LINT_PATHS -name '*.php' -print0 | xargs -0 -r -n1 -P4 php -l
+
+  # ---------------------------------------------------------------------------
+  # 2. BACKUP — a labeled, on-demand WP Engine restore point.
+  #
+  #    ORDER MATTERS AND IT IS WHY THIS WORKFLOW EXISTS. v1's prod workflow took
+  #    the backup first and computed the version four steps later, AFTER the
+  #    deploy — so the version could not appear in the description even in
+  #    principle, and the description was the PR title instead. Here the label is
+  #    an input, so the caller has already resolved it.
+  # ---------------------------------------------------------------------------
+  backup:
+    name: WP Engine restore point
+    needs: [lint]
+    # always() so a disabled lint gate (skipped, not failed) does not cancel this.
+    if: always() && inputs.backup && !inputs.dry_run && needs.lint.result != 'failure'
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.backup.outputs.status }}
+    steps:
+      - name: Request a restore point
+        id: backup
+        env:
+          WPE_API_USER_ID: ${{ secrets.WPE_API_USER_ID }}
+          WPE_API_PASSWORD: ${{ secrets.WPE_API_PASSWORD }}
+          # `vars` in a called workflow resolves against the CALLING repository,
+          # so this reads the caller's repo or org variable.
+          #
+          # The name is BACKUP_NOTIFICATION_EMAIL. The README said
+          # BACKUP_EMAIL_NOTIFICATION until this release; if you set that, unset
+          # it. `notification_emails` is REQUIRED by the WP Engine backup
+          # endpoint, so a wrong variable name is a 400, not a default.
+          NOTIFY: ${{ vars.BACKUP_NOTIFICATION_EMAIL }}
+          INSTALL_NAME: ${{ inputs.wpe_env }}
+          VERSION: ${{ inputs.version }}
+          REQUIRED: ${{ inputs.backup_required }}
+          WAIT: ${{ inputs.backup_wait }}
+        run: |
+          set -euo pipefail
+
+          # One exit point for every "no restore point" path. Whether that is
+          # fatal is the caller's decision, not this workflow's: production sets
+          # backup_required true, staging leaves it false and accepts a warning.
+          fail_or_warn() {
+            echo "status=none" >> "$GITHUB_OUTPUT"
+            if [ "$REQUIRED" = "true" ]; then
+              echo "::error title=No restore point::$1"
+              exit 1
+            fi
+            echo "::warning title=No restore point::$1 Deploying anyway because backup_required is false."
+            exit 0
+          }
+
+          if [ -z "${WPE_API_USER_ID:-}" ] || [ -z "${WPE_API_PASSWORD:-}" ]; then
+            fail_or_warn "WPE_API_USER_ID / WPE_API_PASSWORD are not visible to this repo. Add them as organization secrets from my.wpengine.com/api_access."
+          fi
+          if [ -z "${NOTIFY:-}" ]; then
+            fail_or_warn "The WP Engine API requires notification_emails; set the Actions variable BACKUP_NOTIFICATION_EMAIL (comma-separated addresses allowed)."
+          fi
+
+          # Credentials go in a curl config file, never in argv, so they cannot be
+          # read out of the runner's process table.
+          CFG="${RUNNER_TEMP}/wpe.curlrc"
+          umask 077
+          printf 'user = "%s:%s"\n' "$WPE_API_USER_ID" "$WPE_API_PASSWORD" > "$CFG"
+          trap 'rm -f "$CFG"' EXIT
+          API="https://api.wpengineapi.com/v1"
+
+          # Resolve the install UUID from its NAME.
+          #
+          # This is what removes v1's WPE_INSTALL_ID secret. An install id is
+          # per-install, so a repo can hold exactly one — which is the entire
+          # reason v1 could back up production and never staging. One org-level
+          # credential pair now covers every install on every repo.
+          #
+          # GET /installs is paginated with limit max 100 (WP Engine's OpenAPI).
+          INSTALL_ID=""
+          OFFSET=0
+          while [ "$OFFSET" -le 1000 ]; do
+            PAGE="$(curl -sS --config "$CFG" "${API}/installs?limit=100&offset=${OFFSET}")"
+            INSTALL_ID="$(printf '%s' "$PAGE" | jq -r --arg n "$INSTALL_NAME" \
+              '(.results // [])[] | select(.name == $n) | .id' | head -n1)"
+            [ -n "$INSTALL_ID" ] && break
+            COUNT="$(printf '%s' "$PAGE" | jq -r '(.results // []) | length')"
+            [ "$COUNT" -lt 100 ] && break
+            OFFSET=$((OFFSET + 100))
+          done
+
+          if [ -z "$INSTALL_ID" ]; then
+            fail_or_warn "No install named '${INSTALL_NAME}' is visible to these credentials — either the wpe_env input is wrong or the credentials belong to a different WP Engine account. Note that an account without API access enabled sees no installs at all."
+          fi
+
+          # Fall back to facts rather than to a guessed version. GITHUB_REF_NAME is
+          # the tag on a tag-triggered prod deploy and the branch otherwise.
+          LABEL="${VERSION:-${GITHUB_REF_NAME}@${GITHUB_SHA:0:7}}"
+          DESC="$(printf '%s · %s · %s' "$INSTALL_NAME" "$LABEL" "$GITHUB_REPOSITORY" | LC_ALL=C tr -cd '\11\40-\176' | cut -c1-240)"
+
+          # jq builds the JSON, so quotes, backslashes, backticks or $( ) in a
+          # label cannot break out of the payload or reach the shell. v1 built this
+          # by interpolating the PR title into a `curl -d '...'` string; a title
+          # containing an apostrophe broke a real deploy, and one containing $( )
+          # would have executed on a runner holding the SSH key.
+          #
+          # tr strips non-ASCII BEFORE cut, because cutting UTF-8 by character
+          # count can split a multibyte sequence and jq rejects invalid UTF-8 —
+          # which would fail the deploy over an emoji in a branch name.
+          jq -n --arg d "$DESC" --arg e "$NOTIFY" \
+            '{description: $d,
+              notification_emails: ($e | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}' \
+            > "${RUNNER_TEMP}/backup.json"
+
+          echo "Requesting a restore point on '${INSTALL_NAME}' described as: ${DESC}"
+          HTTP=0
+          CODE="$(curl -sS -o "${RUNNER_TEMP}/resp.json" -w '%{http_code}' \
+            --config "$CFG" \
+            -X POST "${API}/installs/${INSTALL_ID}/backups" \
+            -H 'Content-Type: application/json' \
+            --data @"${RUNNER_TEMP}/backup.json")" || HTTP=1
+
+          # v1's curl had no status check at all, so a 400 from a misnamed email
+          # variable printed an error and the deploy proceeded as though it had a
+          # restore point. Check the code.
+          if [ "$HTTP" -ne 0 ] || [ "$CODE" != "202" ]; then
+            jq -r '.message? // empty' "${RUNNER_TEMP}/resp.json" || true
+            fail_or_warn "WP Engine returned HTTP ${CODE} for the backup request."
+          fi
+
+          BACKUP_ID="$(jq -r '.id // "unknown"' "${RUNNER_TEMP}/resp.json")"
+          echo "status=taken" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Pre-deploy restore point"
+            echo ""
+            echo "- Install: \`${INSTALL_NAME}\`"
+            echo "- Description: \`${DESC}\`"
+            echo "- Backup id: \`${BACKUP_ID}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 202 Accepted means REQUESTED, not finished.
+          if [ "$WAIT" != "true" ]; then
+            echo "::notice title=Backup requested, not awaited::backup_wait is false, so the snapshot runs concurrently with the rsync. It is a restore point for the database and uploads, not a byte-exact pre-deploy snapshot of the theme. Git holds the theme."
+            exit 0
+          fi
+
+          DEADLINE=$(( SECONDS + 1800 ))
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            sleep 30
+            STATUS="$(curl -sS --config "$CFG" "${API}/installs/${INSTALL_ID}/backups/${BACKUP_ID}" | jq -r '.status // "unknown"')"
+            echo "status: ${STATUS}"
+            [ "$STATUS" = "completed" ] && exit 0
+            [ "$STATUS" = "aborted" ] && fail_or_warn "WP Engine aborted the backup."
+          done
+          fail_or_warn "The backup did not reach 'completed' within 30 minutes."
+
+  # ---------------------------------------------------------------------------
+  # 3. DEPLOY
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ inputs.wpe_env }}
+    needs: [lint, backup]
+    # always() so a SKIPPED lint or backup job does not cancel the deploy; the
+    # explicit result checks are what keep a FAILED one blocking.
+    if: always() && !inputs.dry_run && needs.lint.result != 'failure' && needs.backup.result != 'failure'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://${{ inputs.wpe_env }}.wpenginepowered.com
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Deploy theme to WP Engine
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ inputs.src_path }}
+          REMOTE_PATH: ${{ inputs.remote_path }}
+          PHP_LINT: TRUE
+          CACHE_CLEAR: ${{ inputs.cache_clear }}
+          # THE DEFAULT `rsync_flags` DIFFERS FROM THE ACTION'S OWN DEFAULT
+          # (`-azvr --inplace --exclude=".*"`) IN TWO WAYS. Both are deliberate.
+          #
+          # `--delete` is ADDED. Without it a file deleted from the repo lives on
+          # the install forever and the deploy still reports success. That is not
+          # hypothetical: WordPress discovers page templates by regex-scanning
+          # theme PHP files ON DISK, so a deleted template keeps appearing in the
+          # block editor's Template panel — and if it is a high-priority match
+          # like front-page.php it keeps SERVING, plausibly, from content the repo
+          # meant to leave dormant. Blast radius is bounded by REMOTE_PATH, and
+          # rsync never deletes a path matching an --exclude, so dotfiles survive.
+          #
+          # `--inplace` is REMOVED, and this is the one that had been copied
+          # around the fleet unexamined. It writes incoming bytes straight into
+          # the live destination file, skipping rsync's default of writing a
+          # temporary file in the destination directory and rename()-ing it over
+          # the target on completion. A same-directory rename() is atomic, so
+          # under the default a concurrent reader gets the whole old file or the
+          # whole new one. rsync's manual on --inplace: "The file's data will be
+          # in an inconsistent state during the transfer and will be left that way
+          # if the transfer is interrupted or if an update fails."
+          #
+          # A live WordPress theme is the textbook in-use file — functions.php and
+          # every template are read off disk on each request — so a request landing
+          # inside that window compiles a truncated or spliced file and fatals.
+          # With display_errors off on WP Engine that is a blank page whose only
+          # explanation is the install's error log. Opcache does not save you:
+          # revalidating inside the window can compile the garbage and serve it
+          # until the next mtime change. And --inplace implies --partial, so an
+          # interrupted or cancelled run LEAVES the broken bytes there.
+          #
+          # The honest limit: this makes each FILE atomic, not the DEPLOY. Halfway
+          # through, one template can be new while another is still old. It moves
+          # the failure mode from "a file is invalid" to "two valid files are
+          # briefly from different commits". Real deploy atomicity needs a build
+          # directory and a symlink swap, which this action cannot do.
+          FLAGS: ${{ inputs.rsync_flags }}
+
+      - name: Summary
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          TARGET: ${{ inputs.wpe_env }}
+          LABEL: ${{ inputs.version }}
+          BACKUP: ${{ needs.backup.outputs.status }}
+          BACKUP_RESULT: ${{ needs.backup.result }}
+          WANTED_BACKUP: ${{ inputs.backup }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deployed to ${ENV_NAME}"
+            echo ""
+            echo "- Install: \`${TARGET}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            [ -n "${LABEL}" ] && echo "- Label: \`${LABEL}\`"
+            # Say it on EVERY run, not only the bad ones. A warning inside a
+            # collapsed job log is a warning nobody reads, and "was there a
+            # restore point?" should be answerable at a glance.
+            if [ "${BACKUP:-}" = "taken" ]; then
+              echo "- Restore point: **taken**"
+            elif [ "${WANTED_BACKUP}" != "true" ]; then
+              echo "- Restore point: not requested (\`backup: false\`)"
+            else
+              echo "- Restore point: **NONE** — see the backup job. WP Engine's own automatic daily backup is the only fallback. Set \`backup_required: true\` to make this block the deploy instead."
+            fi
+            echo ""
+            echo "The theme is on the install. Content migrations and \`wp rewrite flush\` are SEPARATE manual steps — this action does neither."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 4. DRY RUN — the rehearsal path. Proves the install name resolves and the
+  #    lint passes without writing anything, which is the only way to find out
+  #    that a credential pair cannot see an install BEFORE a real deploy needs it.
+  # ---------------------------------------------------------------------------
+  dry-run-report:
+    name: Dry run
+    needs: [lint]
+    if: always() && inputs.dry_run && needs.lint.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: What a real run would do
+        env:
+          WPE_API_USER_ID: ${{ secrets.WPE_API_USER_ID }}
+          WPE_API_PASSWORD: ${{ secrets.WPE_API_PASSWORD }}
+          INSTALL_NAME: ${{ inputs.wpe_env }}
+          SRC: ${{ inputs.src_path }}
+          DEST: ${{ inputs.remote_path }}
+          FLAGS: ${{ inputs.rsync_flags }}
+          WANTS_BACKUP: ${{ inputs.backup }}
+        run: |
+          set -euo pipefail
+
+          RESOLVED="not checked (no API credentials)"
+          if [ -n "${WPE_API_USER_ID:-}" ] && [ -n "${WPE_API_PASSWORD:-}" ]; then
+            CFG="${RUNNER_TEMP}/wpe.curlrc"; umask 077
+            printf 'user = "%s:%s"\n' "$WPE_API_USER_ID" "$WPE_API_PASSWORD" > "$CFG"
+            trap 'rm -f "$CFG"' EXIT
+            ID=""; OFFSET=0
+            while [ "$OFFSET" -le 1000 ]; do
+              PAGE="$(curl -sS --config "$CFG" "https://api.wpengineapi.com/v1/installs?limit=100&offset=${OFFSET}")"
+              ID="$(printf '%s' "$PAGE" | jq -r --arg n "$INSTALL_NAME" '(.results // [])[] | select(.name == $n) | .id' | head -n1)"
+              [ -n "$ID" ] && break
+              COUNT="$(printf '%s' "$PAGE" | jq -r '(.results // []) | length')"
+              [ "$COUNT" -lt 100 ] && break
+              OFFSET=$((OFFSET + 100))
+            done
+            if [ -n "$ID" ]; then
+              RESOLVED="resolved to \`${ID}\`"
+            else
+              RESOLVED="**NOT FOUND** — these credentials cannot see an install named \`${INSTALL_NAME}\`"
+            fi
+          fi
+
+          {
+            echo "### Dry run — nothing was written"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Install | \`${INSTALL_NAME}\` |"
+            echo "| API lookup | ${RESOLVED} |"
+            echo "| rsync | \`${SRC}\` → \`${DEST}\` |"
+            echo "| Flags | \`${FLAGS}\` |"
+            echo "| Backup a real run would take | \`${WANTS_BACKUP}\` |"
+            echo ""
+            echo "Re-run with \`dry_run: false\` to deploy."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 5. FAILURE NOTICE — carried over from v1's prod workflow, which is the only
+  #    place it existed. Silently dropping it in the rewrite would have removed a
+  #    working capability from every repo that relies on it.
+  # ---------------------------------------------------------------------------
+  notify-failure:
+    name: Notify on failure
+    needs: [lint, backup, deploy]
+    if: always() && (needs.lint.result == 'failure' || needs.backup.result == 'failure' || needs.deploy.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Slack, if a webhook is configured
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENV_NAME: ${{ inputs.environment }}
+          TARGET: ${{ inputs.wpe_env }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "No SLACK_WEBHOOK_URL secret; nothing to notify."
+            exit 0
+          fi
+          # jq, not a quoted -d string: the repo and environment names end up
+          # inside JSON and v1 built this by interpolation.
+          jq -n --arg t ":rotating_light: *${GITHUB_REPOSITORY}* — deploy to ${ENV_NAME} (${TARGET}) failed. <${RUN_URL}|View run>" \
+            '{text: $t}' > "${RUNNER_TEMP}/slack.json"
+          curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            --data @"${RUNNER_TEMP}/slack.json"

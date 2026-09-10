@@ -2,8 +2,8 @@ version: 2
 updates:
   # Keeps the actions used inside the reusable workflows current
   # (actions/checkout, softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
-  # A bump here reaches every site on @v1 once it is released, so review these
-  # PRs like any other change.
+  # A bump here reaches every site on @v2 (and @v1) once it is released, so review
+  # these PRs like any other change.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -25,5 +25,7 @@ updates:
       prefix: "deps"
     # No `labels:` here on purpose. Versioning in this repo is driven by the
     # commit message, not by labels -- see .github/workflows/release-please.yml.
-    # The major/minor/patch labels drive wpe-deploy-prod.yml in SITE repos, and
-    # leaving one on a PR here would only suggest it does something.
+    #
+    # The major/minor/patch labels drove the DEPRECATED v1 wpe-deploy-prod.yml in
+    # site repos. v2 dropped them: a site's version comes from release-please
+    # there too. Leaving one on a PR here would only suggest it does something.

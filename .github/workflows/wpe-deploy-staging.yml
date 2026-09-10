@@ -1,5 +1,9 @@
 name: WP Engine Staging Deploy
 
+# DEPRECATED as of v2 — superseded by `wpe-deploy.yml`, which does every
+# environment from one file. This is kept so nothing pinned to `@v1` breaks.
+# See the README's migration section. Fixes still land here; features do not.
+
 on:
   workflow_call:
     inputs:

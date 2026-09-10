@@ -1,0 +1,44 @@
+name: Deploy to WP Engine Dev
+
+# THE PULL-REQUEST ENVIRONMENT. Every push to an open PR redeploys the dev
+# install, so the work is reviewable on a real site before it lands.
+#
+# ADD THIS FILE ONLY TO A REPO THAT HAS A DEV INSTALL. Most 434 sites do not —
+# a dev install is normally created for an in-place rebuild, where the live site
+# stays up while the new theme is built beside it. On a repo with no dev install,
+# leave this file out: a pull request then deploys nowhere, and staging is
+# reached by merging. That is the v2 default, and it is deliberate — see the
+# note in stage.yaml.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  # cancel-in-progress is TRUE here and FALSE on staging/production. A superseded
+  # dev deploy is worth cancelling: dev takes no real traffic, and the run that
+  # cancelled it is about to overwrite the same files anyway. Cancelling mid-rsync
+  # can still leave the install carrying a partially-applied deploy — with
+  # `--inplace` gone those are whole files from two commits rather than one
+  # half-written file, which is survivable on dev and is not on a site with users.
+  group: deploy-dev-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
+    with:
+      wpe_env: ${{ vars.WPE_DEV_ENV }}
+      src_path: themes/THEME_NAME/
+      remote_path: wp-content/themes/THEME_NAME/
+      environment: dev
+      # No restore point on dev. It is a scratch environment, WP Engine still
+      # takes its own automatic daily backup, and burning an on-demand snapshot on
+      # every push to every PR is noise that makes the staging and production ones
+      # harder to find.
+      backup: false
+      lint_paths: themes/THEME_NAME
+    secrets: inherit
