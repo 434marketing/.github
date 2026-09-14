@@ -1,13 +1,135 @@
 name: Deploy to WP Engine Staging
 
+# STAGING IS REACHED BY MERGING, NOT BY OPENING A PULL REQUEST.
+#
+# THIS IS THE ONE BEHAVIOUR CHANGE IN v2 THAT AFFECTS EVERY EXISTING SITE.
+# Under v1 this template triggered on `pull_request: [opened, synchronize,
+# reopened]`, so every push to any open PR overwrote the staging theme. Two open
+# PRs meant staging showed whichever was pushed last, and nothing said so.
+#
+# v2 splits the two jobs that were being asked of one install:
+#
+#   "let me see this change on a real site"  ->  the dev install (dev.yaml),
+#                                                or a manual run of this workflow
+#   "this is what we are about to release"   ->  staging, on merge
+#
+# HOW TO PUT A PR BRANCH ON STAGING ANYWAY — the deliberate, visible way:
+#   Actions -> Deploy to WP Engine Staging -> Run workflow -> pick the branch.
+# `workflow_dispatch` runs this file from whatever ref you choose, so a branch
+# goes to staging when you decide it should, and the run records who asked.
+#   gh workflow run stage.yml --ref my-branch
+#
+# TO RESTORE v1 BEHAVIOUR on a repo that has no dev install and where you would
+# rather have the convenience, add the open-PR actions to `types` below:
+#   types: [closed, opened, synchronize, reopened]
+# The gate job already handles both shapes, so that single edit is the whole
+# change. Know what you are buying: on that setting, any push to any open PR
+# republishes staging, which is fine when you are the only one pushing and is a
+# trap the moment you are not.
+
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [closed]
+    branches:
+      - $default-branch
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # NOT cancel-in-progress. Cancelling mid-rsync leaves the install carrying a
+  # partially-applied deploy; queueing behind the running one costs a minute.
+  group: deploy-staging
+  cancel-in-progress: false
 
 jobs:
+  # Decides whether this event should deploy, and what to deploy. Kept as its own
+  # job because a reusable workflow cannot be called conditionally on a shell
+  # result — the `uses:` job's `if:` can only read outputs of a job that ran first.
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      ref: ${{ steps.gate.outputs.ref }}
+    steps:
+      - name: Decide deploy / skip
+        id: gate
+        env:
+          # Everything user-controlled crosses into the shell through `env`, never
+          # through ${{ }} inside `run` — a `${{ }}` is substituted textually
+          # before bash parses the line, so a branch or PR title containing $( )
+          # would execute on a runner holding the deploy key.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          HAS_SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-deploy') }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          emit() { printf 'deploy=%s\nref=%s\n' "$1" "${2:-}" >> "$GITHUB_OUTPUT"; }
+
+          # Manual run: deploy whatever ref the run was started from.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run against ${GITHUB_REF}."
+            emit true "$GITHUB_SHA"
+            exit 0
+          fi
+
+          # THE ESCAPE HATCH: the `skip-deploy` label. Chosen over a token in the
+          # commit message or PR title because a squash merge makes the title the
+          # permanent commit subject on the default branch — and the changelog line
+          # release-please writes from it — while a token in a branch commit is
+          # discarded by that same squash. A label is neither: present in the event
+          # payload at merge time, and queryable forever afterwards
+          # (`gh pr list --label skip-deploy --state merged`).
+          #   gh label create skip-deploy --color BFD4F2 --description "Merge without deploying"
+          if [ "$HAS_SKIP_LABEL" = "true" ]; then
+            echo "::notice title=Deploy skipped::The skip-deploy label is on this PR."
+            emit false
+            exit 0
+          fi
+
+          # `closed` fires on close-without-merge too. Only merges ship.
+          if [ "$PR_ACTION" = "closed" ]; then
+            if [ "$MERGED" = "true" ]; then
+              # The merge commit on the base branch — NOT refs/pull/N/merge, which
+              # is a pre-merge test ref and is not guaranteed to outlive the close.
+              emit true "$MERGE_SHA"
+            else
+              echo "::notice title=Deploy skipped::The PR was closed without merging."
+              emit false
+            fi
+            exit 0
+          fi
+
+          # Only reachable if `types` was widened to include the open-PR actions.
+          echo "::warning title=Staging deploy from an OPEN pull request::This repo has opted in to deploying every PR update to staging. Two open PRs will overwrite each other here."
+          emit true "$HEAD_SHA"
+
   deploy:
-    uses: 434marketing/.github/.github/workflows/wpe-deploy-staging.yml@v1
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true'
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
-      theme_path: themes/THEME_NAME/
+      wpe_env: ${{ vars.WPE_STAGE_ENV }}
+      src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      ref: ${{ needs.plan.outputs.ref }}
+      environment: staging
+      backup: true
+      # Warn, do not block. Staging takes every merge, and a credential problem
+      # should not be able to wedge the trunk. Flip to true once a real run has
+      # printed "Restore point: taken" — one line, no other change.
+      backup_required: false
+      # Do not wait for the snapshot: WP Engine backups take many minutes and
+      # staging deploys are frequent. The consequence is that the snapshot runs
+      # concurrently with the rsync, so it is a restore point for the database and
+      # uploads rather than a byte-exact pre-deploy copy of the theme. Git holds
+      # the theme.
+      backup_wait: false
+      lint_paths: themes/THEME_NAME
     secrets: inherit

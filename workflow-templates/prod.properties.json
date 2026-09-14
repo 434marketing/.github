@@ -1,6 +1,6 @@
 {
   "name": "WP Engine Production Deploy",
-  "description": "Backs up and deploys the theme to WP Engine production on PR merge, then creates a versioned GitHub release. Requires WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID, WPE_API_PASSWORD, WPE_INSTALL_ID secrets and WPE_PROD_ENV variable. Optionally uses SLACK_WEBHOOK_URL for failure alerts.",
+  "description": "Deploys the theme to WP Engine production from a vX.Y.Z release tag — the tag release-please creates when its Release PR is merged. Waits for a completed pre-deploy restore point and refuses to deploy without one. Requires the WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID and WPE_API_PASSWORD secrets, the WPE_PROD_ENV variable and the BACKUP_NOTIFICATION_EMAIL variable. Pair with the Release Please template.",
   "iconName": "octicon-rocket",
   "categories": ["Deployment"]
 }

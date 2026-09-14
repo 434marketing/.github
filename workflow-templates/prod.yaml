@@ -1,19 +1,114 @@
 name: Deploy to WP Engine Production
 
+# PRODUCTION DEPLOYS FROM A TAG, AND THE TAG COMES FROM MERGING THE RELEASE PR.
+#
+# THIS IS THE OTHER BEHAVIOUR CHANGE IN v2. Under v1 this template triggered on
+# `pull_request: [closed]` against the default branch, so **merging any PR
+# deployed straight to production** and the reusable workflow invented a version
+# number afterwards from `major`/`minor`/`patch` labels. Landing code and
+# publishing it were the same keystroke, the version was decided after the deploy
+# had already happened, and a forgotten label silently shipped a patch bump.
+#
+# In v2 they are three separate acts:
+#
+#   1. Merge a PR              -> lands on the default branch, deploys to STAGING
+#   2. Merge the Release PR    -> release-please writes the CHANGELOG, bumps the
+#                                 version and creates the vX.Y.Z tag
+#   3. That tag                -> triggers this workflow, which deploys production
+#
+# Step 2 is the gate. The Release PR shows you the exact version and the exact
+# changelog before anything ships, which is the thing the label scheme could not
+# do. This file needs `release-please.yaml` in the same repo to be useful.
+#
+# NOT YET LIVE? Add the hard off-switch. Set the repository variable
+# PROD_DEPLOY_ENABLED to the literal `true`, and put this on the plan job:
+#     if: vars.PROD_DEPLOY_ENABLED == 'true'
+# Then a tag cut before launch cannot reach the public site even by accident.
+
 on:
-  pull_request:
-    types: [closed]
-    branches:
-      - $default-branch
+  push:
+    tags:
+      # Release tags only. Deliberately excludes pre-releases: v1.2.3-rc.1 does
+      # not match, so a release candidate can be tagged without deploying.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to deploy, e.g. v1.2.0. Re-deploying the current tag is the supported way to roll forward after a failed run."
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Resolve and check the tag
+        id: v
+        env:
+          # `inputs` is empty on the push path, where the tag IS the ref.
+          TAG: ${{ inputs.tag || github.ref_name }}
+          # Not named GITHUB_*: that prefix is reserved and GitHub ignores it.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error title=Not a release tag::Refusing to deploy '$TAG'. Production deploys a vX.Y.Z tag."
+              exit 1
+              ;;
+          esac
+
+          # A tag that is not on the trunk was cut on a feature branch or moved
+          # after the fact. Everything on the trunk has been through staging by
+          # construction, because staging deploys on merge; a tag off the trunk
+          # has been through nothing. checkout above fetched full history, but it
+          # checked out a TAG, so the remote-tracking ref for the trunk need not
+          # exist — fetch it by name rather than assuming.
+          git fetch --no-tags --force origin "${DEFAULT_BRANCH}:refs/remotes/origin/trunk"
+          SHA="$(git rev-parse "${TAG}^{commit}")"
+          if ! git merge-base --is-ancestor "$SHA" origin/trunk; then
+            echo "::error title=Tag is not on the default branch::${TAG} (${SHA}) is not reachable from the trunk, so nothing in it has been through staging. Merge the work, let staging deploy it, and tag from there."
+            git log --format='%H %s' "${TAG}" --not origin/trunk | head -n 50
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "${TAG} (${SHA}) is on the trunk."
+
   deploy:
-    if: github.event.pull_request.merged == true
-    uses: 434marketing/.github/.github/workflows/wpe-deploy-prod.yml@v1
+    needs: plan
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
-      theme_path: themes/THEME_NAME/
+      wpe_env: ${{ vars.WPE_PROD_ENV }}
+      src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      ref: ${{ needs.plan.outputs.tag }}
+      version: ${{ needs.plan.outputs.tag }}
+      environment: production
+      backup: true
+      # Both true, and neither is negotiable here. `backup_required` means no
+      # restore point, no deploy. `backup_wait` means the snapshot has actually
+      # COMPLETED before the rsync starts — a 202 from WP Engine means requested,
+      # not taken, and a snapshot running concurrently with the deploy is not a
+      # restore point for the thing you are about to change.
+      backup_required: true
+      backup_wait: true
+      lint_paths: themes/THEME_NAME
     secrets: inherit
