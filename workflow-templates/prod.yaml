@@ -1,6 +1,6 @@
 name: Deploy to WP Engine Production
 
-# PRODUCTION DEPLOYS FROM A TAG, AND THE TAG COMES FROM MERGING THE RELEASE PR.
+# PRODUCTION DEPLOYS A RELEASE TAG, AND THE TAG COMES FROM MERGING THE RELEASE PR.
 #
 # THIS IS THE OTHER BEHAVIOUR CHANGE IN v2. Under v1 this template triggered on
 # `pull_request: [closed]` against the default branch, so **merging any PR
@@ -14,18 +14,39 @@ name: Deploy to WP Engine Production
 #   1. Merge a PR              -> lands on the default branch, deploys to STAGING
 #   2. Merge the Release PR    -> release-please writes the CHANGELOG, bumps the
 #                                 version and creates the vX.Y.Z tag
-#   3. That tag                -> triggers this workflow, which deploys production
+#   3. release-please.yaml     -> CALLS this workflow with that tag, which deploys
+#                                 production
 #
 # Step 2 is the gate. The Release PR shows you the exact version and the exact
 # changelog before anything ships, which is the thing the label scheme could not
-# do. This file needs `release-please.yaml` in the same repo to be useful.
+# do.
 #
-# NOT YET LIVE? Add the hard off-switch. Set the repository variable
-# PROD_DEPLOY_ENABLED to the literal `true`, and put this on the plan job:
-#     if: vars.PROD_DEPLOY_ENABLED == 'true'
-# Then a tag cut before launch cannot reach the public site even by accident.
+# WHY A CALL AND NOT `on: push: tags`: release-please creates the tag with
+# GITHUB_TOKEN, and events created with GITHUB_TOKEN do not start workflow runs.
+# A tag trigger alone would never fire for a release-please tag. So this file has
+# three entry points, one implementation:
+#
+#   workflow_call      the normal path — release-please.yaml, after a release
+#   push (tags)        a vX.Y.Z tag pushed by hand, which does trigger workflows
+#   workflow_dispatch  re-deploy an existing tag; also the dry-run rehearsal
+#
+# NOT YET LIVE? Uncomment the `if:` on the plan job below and leave the
+# repository variable PROD_DEPLOY_ENABLED unset until launch. The plan job runs
+# on all three entry points, so a release cut before launch cannot reach the
+# public site even by accident. Set the variable to `true` on launch day.
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to deploy, e.g. v1.2.0."
+        required: true
+        type: string
+      dry_run:
+        description: "Preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       # Release tags only. Deliberately excludes pre-releases: v1.2.3-rc.1 does
@@ -37,6 +58,11 @@ on:
         description: "Existing release tag to deploy, e.g. v1.2.0. Re-deploying the current tag is the supported way to roll forward after a failed run."
         required: true
         type: string
+      dry_run:
+        description: "Dry run: preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,6 +74,7 @@ concurrency:
 jobs:
   plan:
     name: Plan
+    # if: vars.PROD_DEPLOY_ENABLED == 'true'   # NOT YET LIVE: uncomment until launch
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.v.outputs.tag }}
@@ -67,13 +94,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "::error title=Not a release tag::Refusing to deploy '$TAG'. Production deploys a vX.Y.Z tag."
-              exit 1
-              ;;
-          esac
+          # A regex, not a glob: `v[0-9]*.[0-9]*.[0-9]*` also matches v1.2.3-rc.1,
+          # and the dispatch and call paths have no tag filter in front of them.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Not a release tag::Refusing to deploy '$TAG'. Production deploys a vX.Y.Z tag."
+            exit 1
+          fi
 
           # A tag that is not on the trunk was cut on a feature branch or moved
           # after the fact. Everything on the trunk has been through staging by
@@ -97,11 +123,32 @@ jobs:
     uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
       wpe_env: ${{ vars.WPE_PROD_ENV }}
+      # WHAT TO DEPLOY — keep this block identical in stage.yaml and dev.yaml.
+      # A theme (the default):
       src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      lint_paths: themes/THEME_NAME
+      # A plugin in a subfolder:
+      #   src_path: plugins/PLUGIN_SLUG/
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: plugins/PLUGIN_SLUG
+      # A repo whose root IS the plugin:
+      #   src_path: ./
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: .
+      # Theme + plugin + mu-plugin in ONE deploy (one backup, deployed in this
+      # order) — replaces src_path/remote_path. The mu-plugin FOLDER goes before
+      # its loader file. See the README.
+      #   targets: >-
+      #     [{"src_path": "themes/THEME_NAME/", "remote_path": "wp-content/themes/THEME_NAME/"},
+      #      {"src_path": "plugins/PLUGIN_SLUG/", "remote_path": "wp-content/plugins/PLUGIN_SLUG/"},
+      #      {"src_path": "mu-plugins/PKG/", "remote_path": "wp-content/mu-plugins/PKG/"},
+      #      {"src_path": "mu-plugins/PKG-loader.php", "remote_path": "wp-content/mu-plugins/PKG-loader.php"}]
+      #   lint_paths: themes/THEME_NAME plugins/PLUGIN_SLUG mu-plugins
       ref: ${{ needs.plan.outputs.tag }}
       version: ${{ needs.plan.outputs.tag }}
       environment: production
+      dry_run: ${{ inputs.dry_run || false }}
       backup: true
       # Both true, and neither is negotiable here. `backup_required` means no
       # restore point, no deploy. `backup_wait` means the snapshot has actually
@@ -110,5 +157,4 @@ jobs:
       # restore point for the thing you are about to change.
       backup_required: true
       backup_wait: true
-      lint_paths: themes/THEME_NAME
     secrets: inherit

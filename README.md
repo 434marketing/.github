@@ -10,35 +10,53 @@ Three environments, three different triggers, and no two of them are the same ev
 |---|---|---|---|
 | **Dev** | every push to an open pull request | `dev.yaml` | only repos that have a dev install — normally an in-place rebuild |
 | **Staging** | a pull request **merges** into the default branch, or a manual run from any branch | `stage.yaml` | every repo |
-| **Production** | a `vX.Y.Z` **tag** is pushed — which happens when the release-please Release PR is merged | `prod.yaml` + `release-please.yaml` | every live repo |
+| **Production** | the release-please **Release PR merges**: release-please cuts the `vX.Y.Z` tag and calls `prod.yaml` with it. A `vX.Y.Z` tag pushed by hand also deploys | `release-please.yaml` + `prod.yaml` | every repo, gated off until launch |
 
 Read as a sentence: **a pull request is dev, the default branch is staging, and a
-tag is production.** A branch is not an environment.
+release is production.** A branch is not an environment.
 
 ### What changed from v1, and why
 
 v1 had two triggers and they were both one step too eager.
 
 **Opening or updating a pull request deployed to staging.** Every push to any open
-PR overwrote the staging theme, so two open PRs meant staging showed whichever was
-pushed last and nothing said so. In v2 the pull-request environment is **dev**, and
-staging is what you get by merging. On a repo with no dev install a pull request now
-deploys nowhere, which is the point: staging stops being scratch space.
+PR overwrote staging, so two open PRs meant staging showed whichever was pushed last
+and nothing said so. In v2 the pull-request environment is **dev**, and staging is
+what you get by merging. On a repo with no dev install a pull request now deploys
+nowhere, which is the point: staging stops being scratch space.
 
 **Merging a pull request deployed straight to production, and picked the version
 afterwards.** `wpe-deploy-prod.yml` deployed on merge and *then* read `major` /
 `minor` / `patch` labels off the PR to compute a tag. Landing code and publishing it
 were the same keystroke, the version was decided after the deploy had already
 happened, and a forgotten label silently shipped a patch bump. In v2 production
-deploys from a tag, and the tag comes from merging a Release PR that shows you the
+deploys a release, and the release comes from merging a Release PR that shows you the
 exact version and changelog first.
+
+### Why release-please *calls* the production deploy
+
+A tag created with `GITHUB_TOKEN` does not start other workflows — only
+`workflow_dispatch` and `repository_dispatch` are exempt from that rule. release-please
+creates its tag with `GITHUB_TOKEN`, so a `push: tags` trigger in `prod.yaml` would
+never fire for it. `release-please.yaml` therefore has a second job, `production`,
+that runs only when a release was cut and calls `prod.yaml` with the new tag through
+`workflow_call`. This repo moves its own `v<major>` tag the same way.
+
+`prod.yaml` keeps `push: tags` for a tag pushed by hand, and `workflow_dispatch` to
+re-deploy an existing tag. All three paths run the same plan job, so the trunk check
+and the `PROD_DEPLOY_ENABLED` gate apply to each.
+
+The consequence: **`release-please.yaml` needs `prod.yaml` in the same repo.** A
+`uses:` pointing at a missing file fails the whole workflow at startup, Release PR
+included. On a site that is not live yet, add `prod.yaml` anyway and uncomment its
+gate (see [Setting up a site repo](#setting-up-a-site-repo)).
 
 ### If you want a PR branch on staging
 
 That need is real and v2 keeps it — as a decision rather than a side effect:
 
 ```sh
-gh workflow run stage.yml --ref my-branch
+gh workflow run stage.yaml --ref my-branch
 ```
 
 or **Actions → Deploy to WP Engine Staging → Run workflow**, and pick the branch.
@@ -62,9 +80,9 @@ the run summary when it fires from an open PR, so the choice stays visible.
 
 ### `wpe-deploy.yml` — **v2, use this one**
 
-One reusable workflow for every environment. What differs between dev, staging and
-production is configuration, so it is inputs rather than three files that have to be
-kept in step by hand.
+One reusable workflow for every environment, and for themes, plugins and mu-plugins
+alike. What differs between dev, staging and production is configuration, so it is
+inputs rather than three files that have to be kept in step by hand.
 
 ```yaml
 jobs:
@@ -74,27 +92,44 @@ jobs:
       wpe_env: ${{ vars.WPE_STAGE_ENV }}
       src_path: themes/my-theme/
       remote_path: wp-content/themes/my-theme/
+      lint_paths: themes/my-theme
       environment: staging
       backup: true
     secrets: inherit
 ```
 
+The run is five jobs: **preflight** (refuses a dangerous deploy shape), **lint**,
+**backup**, **deploy**, and a Slack notice on failure. Each one only starts when
+everything before it succeeded or was deliberately skipped — a cancelled run never
+reaches the rsync.
+
 | Input | Required | Default | Notes |
 |---|---|---|---|
 | `wpe_env` | yes | — | Install **name**, not id |
-| `src_path` | yes | — | Trailing slash copies the directory's *contents* |
-| `remote_path` | yes | — | Destination on the install |
 | `environment` | yes | — | `dev` / `staging` / `production`. Created on first use; this is what gives you deployment history and the option of a required reviewer |
-| `ref` | no | caller's ref | Pass the merge commit on a merged `pull_request` |
-| `version` | no | `<ref-name>@<short-sha>` | A **label for the restore point**, never a release version |
+| `src_path` | one of these | — | A directory ends with `/` (its *contents* are copied); `./` is a repo whose root is the plugin. A single file is allowed too |
+| `remote_path` | two, or `targets` | — | One folder: `wp-content/{plugins,themes,mu-plugins}/<slug>/`. For a file, the destination file |
+| `targets` | | — | JSON list of `{src_path, remote_path}`, deployed in order after one lint and one backup. Replaces the two above. At most 6 |
+| `allow_unsafe_remote_path` | no | `false` | The only bypass of the one-folder rule. Warns on every run |
+| `ref` | no | caller's ref | Pass the merge commit on a merged `pull_request`. Resolved to one commit in preflight |
+| `version` | no | `<branch>@<short-sha>` | A **label for the restore point**, never a release version |
 | `backup` | no | `false` | Request a WP Engine restore point first |
 | `backup_required` | no | `false` | No restore point, no deploy. `true` for production |
 | `backup_wait` | no | `false` | Wait for `completed`. A 202 means *requested* |
-| `lint_paths` | no | `.` | Space-separated `php -l` paths; empty disables the gate |
-| `php_version` | no | `8.2` | Match the install |
+| `lint_paths` | no | `.` | Space-separated `php -l` paths; empty disables the gate. **Set it** in any repo that holds more than the deployed code — `.` lints the whole repo |
+| `php_version` | no | `8.2` | Match the install. Also the PHP for `setup_composer` |
+| `php_versions` | no | — | JSON list, e.g. `["7.4","8.4"]`: lint once per version. Overrides `php_version` for lint |
 | `rsync_flags` | no | see below | Replaces the whole string when set |
-| `cache_clear` | no | `true` | Flush page and CDN cache after deploying |
-| `dry_run` | no | `false` | Lint, resolve the install, write nothing |
+| `extra_excludes` | no | — | Space-separated patterns, appended as `--exclude=<p>`. Keeps the defaults |
+| `build_command` | no | — | Runs from the repo root before the rsync, e.g. `composer install --no-dev` |
+| `setup_node` | no | — | Node version for `build_command`, e.g. `20` |
+| `setup_composer` | no | `false` | PHP + Composer for `build_command` |
+| `post_deploy_script` | no | — | Script on the install, run after the last target. See [Post-deploy checks](#post-deploy-checks) |
+| `smoke_wp_cli` | no | `false` | `wp eval` on the install after deploying; any fatal fails the run |
+| `require_active_plugin` | no | — | Slug that must be active after deploying |
+| `smoke_urls` | no | — | Space-separated paths fetched after deploying; non-2xx fails the run |
+| `cache_clear` | no | `true` | Flush page and CDN cache, once, after the last target |
+| `dry_run` | no | `false` | Preflight, lint, resolve the install, write nothing |
 
 **Required secret:** `WPE_SSHG_KEY_PRIVATE`
 
@@ -103,7 +138,9 @@ the `BACKUP_NOTIFICATION_EMAIL` **variable**. `notification_emails` is a *requir
 field on the WP Engine backup endpoint, so a missing or misspelled variable is a 400,
 not a default.
 
-**Optional secret:** `SLACK_WEBHOOK_URL` — a failed deploy posts to it if it is set.
+**Optional secret:** `SLACK_WEBHOOK_URL` — posts when a deploy fails, and when a
+**production** deploy is cancelled, because a cancellation mid-deploy is exactly when
+someone needs to look.
 
 **There is no `WPE_INSTALL_ID`, and there should not be.** v1's prod workflow held the
 install's UUID as a secret, and an install id is per-install — so a repo could hold
@@ -111,7 +148,205 @@ exactly one, which is the whole reason v1 could back up production and never sta
 `wpe-deploy.yml` resolves the id from the install *name* through `GET /installs`, so
 one org-level credential pair covers every install on every repo. If your account
 does not have API access enabled it will see no installs at all; run with
-`dry_run: true` to find that out before a deploy needs it.
+`dry_run: true` to find that out before a deploy needs it. A WP Engine API error during
+that lookup is reported as an error, never as "not found" — and on staging
+(`backup_required: false`) it warns instead of blocking the deploy.
+
+#### Preflight: what it refuses
+
+The deploy action protects a site in exactly one way: a fixed exclude list it
+generates when `REMOTE_PATH` is spelled *exactly* `''`, `.`, `wp-content(/)` or
+`wp-content/mu-plugins(/)`. Nothing in it bounds `--delete`. Each of these exited
+rsync 0 — a green deploy — when reproduced against the action's own code:
+
+| `src_path` → `remote_path` | What happened |
+|---|---|
+| `plugins/lyh-welcome/` → `wp-content/plugins/` (slug forgotten) | Deleted every other plugin, and left this one's files loose at the plugins root |
+| `plugins/` → `wp-content/plugins/` | Deleted every plugin not in git, and overwrote live third-party plugins with older git copies |
+| `plugins/lyh-welcome` → `wp-content/plugins/lyh-welcome/` (no trailing slash) | Shipped into `lyh-welcome/lyh-welcome/`. The old plugin kept running |
+
+So the **preflight** job checks every target before lint and backup, and again in the
+deploy job after the build, against the tree that will actually ship. It fails the run
+when:
+
+1. `remote_path` starts with `/` or `./`, or contains `//`, a `.` or a `..` segment.
+   The action's protections are an exact string match, so a non-canonical spelling
+   silently switches them off.
+2. `src_path` does not exist in the commit being deployed.
+3. `src_path` is a directory without a trailing `/` (rsync would nest it one level
+   too deep), or a file whose `remote_path` is not a file of the same name.
+4. The flags contain `--delete` and `remote_path` is a shared root: the site root,
+   `wp-content/`, `wp-content/plugins/`, `wp-content/themes/`, `wp-content/mu-plugins/`
+   or `wp-content/uploads/`. The one way through, for a root deploy you really mean, is
+   `--filter='P /*'` in `rsync_flags`, placed before any include, `R` rule or rules
+   file (nothing at the top level is ever deleted; rsync applies the first rule that
+   matches, so an earlier include would override it), *plus*
+   `allow_unsafe_remote_path: true`.
+5. A directory deploy targets anything but **one** folder,
+   `wp-content/{plugins,themes,mu-plugins}/<slug>/`, or a file deploy lands outside
+   those three directories — unless `allow_unsafe_remote_path: true`, which warns on
+   every run.
+6. A `wp-content/plugins/<slug>/` folder has no `*.php` directly in it with a
+   non-empty `Plugin Name:` header, or a `wp-content/themes/<slug>/` folder has no
+   `style.css` with `Theme Name:`. That is almost always the wrong `src_path`.
+7. A single `.php` file is deployed and `lint_paths` does not cover it. The action's own
+   `PHP_LINT` runs `find "$SRC_PATH"/`, which finds nothing for a file and still prints
+   success — so the lint job is the only lint that file gets.
+
+It also rejects `--delete-excluded` (it would delete the very files the action's
+excludes protect), `--inplace` together with `--delay-updates` (rsync refuses the pair),
+two targets with the same destination, nested targets under `--delete`, a non-option
+word in `rsync_flags`, an empty `wpe_env` (an unset `WPE_*_ENV` variable), and malformed
+`targets`, `php_versions`, `post_deploy_script`, `require_active_plugin` or `smoke_urls`
+values. It warns when an mu-plugin loader is listed before its folder.
+
+With `build_command` set, a `src_path` the build will create cannot be checked before the
+build. Preflight then still applies every rule that depends only on `remote_path`, and
+leaves the rest to the second pass after the build.
+
+The run is also pinned to **one commit**: preflight resolves `ref` to a SHA, and lint,
+the backup label and the deploy all use that SHA. A branch that moves during a
+30-minute production backup wait cannot slip a different commit into the rsync.
+
+#### Deploying plugins and mu-plugins
+
+Every shape below is one `with:` block. The workflow templates carry the same
+examples next to `THEME_NAME`.
+
+**A plugin in a subfolder of the repo:**
+
+```yaml
+      src_path: plugins/lyh-welcome/
+      remote_path: wp-content/plugins/lyh-welcome/
+      lint_paths: plugins/lyh-welcome
+```
+
+**A repo whose root *is* the plugin** — `./` is the shape for that. Exclude what
+should not ship; anchored patterns (a leading `/`) match only at the top of
+`src_path`, so a vendored `vendor/foo/README.md` still ships:
+
+```yaml
+      src_path: ./
+      remote_path: wp-content/plugins/lyh-welcome/
+      lint_paths: .
+      extra_excludes: /README.md /CHANGELOG.md /docs/ /tests/ /phpunit.xml.dist
+```
+
+**An mu-plugin** is two deploys, **in this order** — the folder, then the loader as a
+single file — and never the `mu-plugins/` root, which preflight refuses under
+`--delete`. A root deploy keeps only the 12 WP Engine mu-plugins the action's
+exclude list happens to name, and deletes every other mu-plugin on the server: client
+and vendor ones, and any WP Engine mu-plugin newer than that list.
+
+```yaml
+      targets: >-
+        [{"src_path": "mu-plugins/lyh-core/",
+          "remote_path": "wp-content/mu-plugins/lyh-core/"},
+         {"src_path": "mu-plugins/lyh-core-loader.php",
+          "remote_path": "wp-content/mu-plugins/lyh-core-loader.php"}]
+      lint_paths: mu-plugins
+```
+
+Folder first, because WordPress runs every top-level `wp-content/mu-plugins/*.php` on
+every request, so a loader that lands before its code is a site-wide fatal. And an
+mu-plugin fatal is worse than a plugin one: **WordPress's recovery mode does not cover
+mu-plugins.** Guard the loader so a missing folder degrades instead of killing the site:
+
+```php
+<?php
+// wp-content/mu-plugins/lyh-core-loader.php
+if ( is_readable( __DIR__ . '/lyh-core/lyh-core.php' ) ) {
+	require_once __DIR__ . '/lyh-core/lyh-core.php';
+}
+```
+
+**Theme + plugin + mu-plugin in one deploy.** One lint pass, **one** backup, then the
+targets deploy one after another in array order, stopping at the first failure. The
+cache is flushed once, after the last one. Three separate calls would mean three
+backups (each up to 30 minutes on production), three cache flushes, and no order.
+
+```yaml
+      targets: >-
+        [{"src_path": "themes/lyh/",            "remote_path": "wp-content/themes/lyh/"},
+         {"src_path": "plugins/lyh-welcome/",   "remote_path": "wp-content/plugins/lyh-welcome/"},
+         {"src_path": "mu-plugins/lyh-core/",   "remote_path": "wp-content/mu-plugins/lyh-core/"},
+         {"src_path": "mu-plugins/lyh-core-loader.php",
+          "remote_path": "wp-content/mu-plugins/lyh-core-loader.php"}]
+      lint_paths: themes/lyh plugins/lyh-welcome mu-plugins
+```
+
+**A plugin with a build step.** CI deploys a *checkout*, so anything git-ignored —
+`vendor/`, `build/`, compiled assets — is not in it, and `--delete` removes the
+server's copy. A plugin with git-ignored runtime dependencies must either build in the
+deploy job or drop `--delete` from `rsync_flags`:
+
+```yaml
+      src_path: plugins/lyh-welcome/
+      remote_path: wp-content/plugins/lyh-welcome/
+      setup_composer: true
+      setup_node: "20"
+      build_command: >-
+        cd plugins/lyh-welcome && composer install --no-dev --optimize-autoloader
+        && npm ci && npm run build
+```
+
+The build runs in the deploy job, after checkout and before the rsync, so the built
+tree is what ships; preflight runs again after it. The lint job lints the source, not
+the build output. Note that `node_modules` and `package.json` are in the default
+excludes; `vendor/` is not.
+
+**A plugin with a PHP support floor:** `php_versions: '["7.4","8.4"]'` lints against
+each version in parallel.
+
+#### Plugin lifecycle
+
+- **The first deploy does not activate the plugin.** Run `wp plugin activate <slug>`
+  once per install (and `--network` on multisite).
+- **A renamed main file or folder deactivates the plugin, silently.** WordPress stores
+  the active plugin as `folder/file.php`. Set `require_active_plugin` so the deploy
+  fails instead.
+- **To remove a plugin,** run `wp plugin deactivate <slug> && wp plugin delete <slug>`
+  on each install *before* deleting the caller. Removing the workflow leaves the
+  plugin on the server; nothing else ever deletes it.
+
+#### Post-deploy checks
+
+`php -l` cannot see a runtime fatal — a missing class, a bad `require_once`, a function
+that does not exist on the install's PHP. A plugin fatal leaves the front end broken
+and an mu-plugin fatal has no recovery mode, and without a check the run is green
+either way. All four are opt-in and run after the last target, so a failure reaches
+the Slack notice:
+
+| Input | What it does |
+|---|---|
+| `smoke_wp_cli: true` | Runs `wp eval 'echo "ok";'` over the SSH gateway. That loads WordPress with every active plugin, mu-plugin and the theme, so any fatal in them fails the run |
+| `require_active_plugin: lyh-welcome` | `wp plugin is-active lyh-welcome` must succeed |
+| `smoke_urls: "/ /wp-login.php"` | Fetches each path from `https://<install>.wpenginepowered.com`, following redirects, retrying a 5xx twice; anything but a final 2xx fails |
+| `post_deploy_script: wp-content/plugins/lyh-welcome/bin/post-deploy.sh` | Runs the script with `bash` on the install, from the site root, after the rsync. Non-zero fails the run |
+
+```yaml
+      smoke_wp_cli: true
+      require_active_plugin: lyh-welcome
+      smoke_urls: "/ /wp-login.php"
+```
+
+Things worth knowing:
+
+- **These checks run after the code is live.** A failure means the bad code *is*
+  deployed and the run says so; fix forward, or re-deploy the previous release
+  (`gh workflow run prod.yaml -f tag=vX.Y.Z`).
+- `smoke_wp_cli` runs the install's **CLI** PHP, which is its *configured* version.
+  During a PHP Test Driver session the web tier can serve a different one, and only
+  `smoke_urls` exercises that.
+- The wp-cli checks send their script over stdin to `bash -s`. The WP Engine SSH
+  gateway strips quoting from a command line, so the same commands passed as an `ssh`
+  argument arrive mangled.
+- A password-protected install answers `smoke_urls` with a 401. Don't use it there.
+- `post_deploy_script` must be a path **inside a deployed folder**, given from the site
+  root, so this deploy's rsync refreshes it — preflight checks both. The reason is an
+  upstream bug: the action uploads the script only when it is *missing* on the server
+  (`entrypoint.sh` tests `test -s` and an uninitialised `status`), so a script that
+  already exists there is never updated by the action itself.
 
 #### What this workflow will not do
 
@@ -120,29 +355,42 @@ does not have API access enabled it will see no installs at all; run with
   before it ships.
 - **Read `major` / `minor` / `patch` labels.** Version numbers come from commit
   messages. See [Versioning a site repo](#versioning-a-site-repo).
-- **Run content migrations or flush rewrite rules.** Neither the action nor this
-  workflow touches the database. Those stay manual.
+- **Activate plugins, run content migrations or flush rewrite rules.** Neither the
+  action nor this workflow touches the database. Those stay manual.
 
 #### rsync flags
 
 The default is:
 
 ```
--azvr --delete --exclude=.* --exclude=node_modules --exclude=package.json
---exclude=package-lock.json --exclude=yarn.lock --exclude=vite.config.js
---exclude=webpack.mix.js --exclude=gulpfile.js --exclude=postcss.config.js
+-azvr --delete --delay-updates --delete-delay --exclude=.* --exclude=node_modules
+--exclude=package.json --exclude=package-lock.json --exclude=yarn.lock
+--exclude=vite.config.js --exclude=webpack.mix.js --exclude=gulpfile.js
+--exclude=postcss.config.js
 ```
 
-It differs from the deploy action's own default (`-azvr --inplace --exclude=".*"`) in
-two ways, and both are deliberate.
+Write every option as `--name=value`. Preflight rejects a word in `rsync_flags` that is
+not an option, because rsync would read it as one more *source* and deploy it into the
+target too — `--exclude=foo bar` merges a folder called `bar` into the plugin, green.
+It also rejects an empty `rsync_flags`, which the action would quietly replace with its
+own `--inplace` default.
+
+Whatever `rsync_flags` says, the action **always appends**
+`--exclude-from=<its generated list>` and `--chmod=D775,F664` after it
+(`entrypoint.sh` in `wpengine/site-deploy`). The generated list is the WP Engine
+protection described under [Preflight](#preflight-what-it-refuses), and it applies only
+to the exact `REMOTE_PATH` spellings listed there.
+
+The default differs from the deploy action's own (`-azvr --inplace --exclude=".*"`) in
+three ways, and all are deliberate.
 
 **`--delete` is added.** The action's default never deletes, so a file removed from
 git lives on the install forever while the deploy still reports success. WordPress
 discovers page templates by regex-scanning theme PHP files *on disk*, so a deleted
 template keeps appearing in the block editor's Template panel — and if it is a
-high-priority match like `front-page.php` it keeps *serving*. Blast radius is bounded
-by `remote_path`, and rsync never deletes a path matching an `--exclude`, so dotfiles
-on the install survive.
+high-priority match like `front-page.php` it keeps *serving*. **What bounds `--delete`
+is preflight**, which holds every directory deploy to a single plugin, theme or
+mu-plugin folder. The action does not bound it.
 
 **`--inplace` is removed**, which is what makes each file's replacement atomic. It had
 been copied around the fleet unexamined — it is in the action's default, so it was in
@@ -155,25 +403,70 @@ reader gets the whole old file or the whole new one. rsync's manual, on `--inpla
 > The file's data will be in an inconsistent state during the transfer and will be
 > left that way if the transfer is interrupted or if an update fails.
 
-A live WordPress theme is the textbook in-use file — `functions.php` and every
-template are read off disk on each request — so a request landing inside that window
-compiles a truncated or spliced file and fatals. With `display_errors` off on WP
-Engine that is a blank page whose only explanation is the install's error log.
-Opcache does not save you: revalidating inside the window can compile the garbage and
-serve it until the next mtime change. And `--inplace` implies `--partial`, so an
-interrupted or cancelled run *leaves* the broken bytes in place.
+A live WordPress site is the textbook in-use file set — `functions.php`, a plugin's
+main file and every template are read off disk on each request — so a request landing
+inside that window compiles a truncated or spliced file and fatals. With
+`display_errors` off on WP Engine that is a blank page whose only explanation is the
+install's error log. Opcache does not save you: revalidating inside the window can
+compile the garbage and serve it until the next mtime change. And `--inplace` implies
+`--partial`, so an interrupted or cancelled run *leaves* the broken bytes in place.
 
-**The honest limit:** this makes each *file* atomic, not the *deploy*. Halfway through
-an rsync, one template can be new while another is still old. It moves the failure
-mode from "a file is syntactically invalid" to "two valid files are briefly from
-different commits". Real deploy atomicity needs a build directory and a symlink swap,
-which the WP Engine action cannot do. One residual: without `--inplace`, an rsync
-killed with `SIGKILL` can leave a `.name.XXXXXX` temp file behind, and `--exclude=.*`
-means `--delete` will never clean it up — a stray dotfile rather than a served
-template, so still the better trade.
+**`--delay-updates --delete-delay` are added.** Per-file atomicity alone still let a
+new plugin main file go live before the new include it `require_once`s had arrived, and
+every request in that window fatals — reproduced. With these two flags each updated
+file waits in a `.~tmp~` holding directory, all of them are renamed into place in one
+burst at the **end** of the transfer, and deletions happen after that.
 
-This fix is also backported to the two v1 workflows below, so it reaches `@v1` sites
-as soon as a `v1.x` release is cut.
+**The honest limit:** each file is atomic and all updates are applied together at the
+end of the transfer, but that burst of renames is not itself one atomic act — a request
+can still land between two of them. In a 3,000-file harness run, 1,653 files were still
+waiting when the first one went live. Only a build directory plus a symlink swap makes a
+whole deploy atomic, and the WP Engine action cannot do that.
+
+**What an interrupted deploy leaves behind** (reproduced with the action's own code and
+rsync 3.4.3, killing either end with SIGTERM or SIGKILL): the live files are exactly as
+they were, and nothing is deleted. Beyond that:
+
+- If the deploying side dies — a cancelled run, a dropped connection — the folder keeps a
+  `.~tmp~/` holding directory with the finished new files and the one that was in
+  flight. The next successful deploy of the same or a later commit normally removes it.
+  It stays for good only if a file waiting in it has since been deleted from git:
+  rsync protects its own holding directory from `--delete`. Remove that one by hand.
+- Only if the server-side rsync itself is killed is the in-flight file left as a stray
+  `.name.XXXXXX` dotfile in the live directory. `--exclude=.*` shields it from
+  `--delete`, so remove it by hand.
+
+Compare the action's default: an interrupted `--inplace` run left the live file
+matching neither the old nor the new version, with earlier files already new.
+
+The `--inplace` fix shipped to every `@v1` site in **v1.1.3** (#16).
+
+**Excludes.** To add one, use `extra_excludes` rather than restating `rsync_flags` —
+the defaults then stay as they are:
+
+```yaml
+      extra_excludes: /README.md /CHANGELOG.md /docs/
+```
+
+- A leading `/` anchors a pattern to the top of `src_path`. Unanchored, `README.md`
+  would also drop every vendored `vendor/*/README.md`.
+- An exclude also **shields** the server's copy from `--delete`: an excluded path is
+  neither updated nor removed.
+- Git-ignored files never ship, whatever the excludes say — CI deploys a checkout.
+
+**Dotfiles never deploy, and never update.** `--exclude=.*` means a plugin-shipped
+`.htaccess` or `.well-known/` never reaches the server, and a stale server copy is
+neither updated nor removed. To ship one, restate `rsync_flags` with an include placed
+**before** `--exclude=.*` — rsync uses the first rule that matches:
+
+```yaml
+      rsync_flags: >-
+        -azvr --delete --delay-updates --delete-delay
+        --include=/.htaccess --exclude=.*
+        --exclude=node_modules --exclude=package.json --exclude=package-lock.json
+        --exclude=yarn.lock --exclude=vite.config.js --exclude=webpack.mix.js
+        --exclude=gulpfile.js --exclude=postcss.config.js
+```
 
 ---
 
@@ -196,17 +489,19 @@ land in them; features do not. See [Migrating from v1 to v2](#migrating-from-v1-
 ## Setting up a site repo
 
 Add the workflows from **Actions → New workflow**, under *By 434marketing*, or copy
-them out of `workflow-templates/`. Replace `THEME_NAME` in each one.
+them out of `workflow-templates/`. Replace `THEME_NAME` in each one — or swap in the
+plugin or mu-plugin block from the comments beside it. Nothing else needs editing:
+the templates find the repository's default branch themselves, so `main`, `master`
+and `develop` repos all work as copied.
 
 | Add | When |
 |---|---|
 | `stage.yaml` | always |
-| `release-please.yaml` | always — `prod.yaml` needs the tag it creates |
-| `prod.yaml` | once the site is live |
+| `release-please.yaml` **and** `prod.yaml` | always, together — release-please calls `prod.yaml` when it cuts a release. **Not live yet?** Uncomment the `if: vars.PROD_DEPLOY_ENABLED == 'true'` line on `prod.yaml`'s plan job, and set that variable to `true` on launch day |
 | `dev.yaml` | only if the site has a dev install |
 
 `release-please.yaml` also needs two files that a workflow template cannot carry.
-Copy them from `client-repo-templates/` and edit the theme path in the config:
+Copy them from `client-repo-templates/` and edit the paths in the config:
 
 ```sh
 mkdir -p .github
@@ -214,6 +509,9 @@ cp client-repo-templates/release-please-config.json      .github/
 cp client-repo-templates/.release-please-manifest.json   .github/
 cp client-repo-templates/VERSION                         .github/
 ```
+
+A repo that already has `vX.Y.Z` tags — every repo that ran v1's prod workflow — needs
+one more step first: [Repos that already have release tags](#repos-that-already-have-release-tags).
 
 Then set, per repo:
 
@@ -227,8 +525,20 @@ Then set, per repo:
 `BACKUP_NOTIFICATION_EMAIL` live at the **organization** level and need nothing
 per repo.
 
+Keep the variables at repository or organization level, **not** on a GitHub
+Environment. The callers read `WPE_*_ENV` in `with:` and the backup job reads
+`BACKUP_NOTIFICATION_EMAIL` before any job that declares an environment runs, so an
+environment-level variable arrives empty. If you restrict the `production`
+environment to certain branches or tags, allow **both** the default branch and
+`v*` tags: a release deploys from the release-please run on the default branch, and
+a hand-pushed tag from the tag.
+
 One repo setting: **Settings → Actions → General → "Allow GitHub Actions to create
 and approve pull requests"** must be on, or release-please cannot open its PR.
+
+The Release PR is opened by `github-actions[bot]`, so on a repo with `dev.yaml` its
+pull-request run waits for **Approve workflows to run**. Leave it unapproved; the
+Release PR changes only the changelog and version files.
 
 And one label, used by `stage.yaml` to land something on the trunk without shipping it:
 
@@ -238,12 +548,14 @@ gh label create skip-deploy --color BFD4F2 --description "Merge without deployin
 
 ### Rehearse before the first real deploy
 
-`dry_run` lints, resolves the install name through the API and writes nothing. It is
-the only way to find out that a credential pair cannot see an install *before* a
-deploy needs it — worth one run per repo during the rollout.
+`dry_run` runs preflight, lints, resolves the install name through the API and writes
+nothing. It is the only way to find out that a credential pair cannot see an install
+— or that a deploy shape is one preflight refuses — *before* a deploy needs it. Worth
+one run per repo during the rollout. Both `stage.yaml` and `prod.yaml` expose it:
 
 ```sh
-gh workflow run stage.yml --ref main -f dry_run=true   # if you expose the input
+gh workflow run stage.yaml --ref main -f dry_run=true
+gh workflow run prod.yaml -f tag=v1.4.2 -f dry_run=true
 ```
 
 ## Versioning a site repo
@@ -258,17 +570,137 @@ short version:
    version and changelog it will write.
 3. Merging that PR writes `CHANGELOG.md`, bumps the version, and creates the
    `vX.Y.Z` tag.
-4. The tag triggers `prod.yaml`, which deploys production.
+4. The same run then calls `prod.yaml` with that tag, which deploys production.
 
-`feat:` cuts a minor, `fix:` a patch, a `!` before the colon cuts a major, and
-`chore:` / `ci:` / `build:` / `test:` / `style:` cut nothing. The first release of a
-new repo is `1.0.0`, not `0.1.0` — with no prior release, release-please skips the
-bump rules and returns `initial-version`, which is `1.0.0` for release-type `simple`.
+Verified per type against the client config:
 
-Listing `themes/THEME_NAME/style.css` in `extra-files` makes the release commit
-rewrite the theme's `Version:` header, so what WordPress shows in **Appearance →
-Themes** matches the tag. That is also why the release commit is worth deploying to
-staging rather than skipping.
+| Title | Effect |
+|---|---|
+| `feat:` | MINOR |
+| `fix:`, `docs:`, `perf:`, `deps:`, `refactor:`, `revert:` | PATCH |
+| `!` before the colon, or a `BREAKING CHANGE:` footer — any type, hidden or not | MAJOR |
+| `chore:`, `ci:`, `build:`, `test:`, `style:` | nothing |
+| a type the config does not list (`wip:`, `feature:`), or a title that is not a conventional commit (`Update style.css`, GitHub's default `Revert "…"`) | nothing — and not in the changelog |
+
+One trap: `feature:` cuts nothing on its own, but next to a visible commit it silently
+makes the release a MINOR, without appearing in the changelog. Write `feat:`. A
+`Release-As: 1.5.0` footer forces an exact version, whatever the type.
+
+The first release of a new repo is `1.0.0`, not `0.1.0` — with no prior release,
+release-please skips the bump rules and returns `initial-version`, which is `1.0.0` for
+release-type `simple`.
+
+### The `Version:` header needs markers
+
+Listing a file in `extra-files` does **not**, on its own, rewrite a theme's or plugin's
+`Version:` header. release-please gives a string `extra-files` entry a format-specific
+updater only for `.json`, `.yaml`/`.yml`, `.toml` and `.xml`; anything else — `.css`,
+`.php` — gets the `Generic` updater, which rewrites only lines carrying
+`x-release-please-version`, or lines between `x-release-please-start-version` and
+`x-release-please-end`. An unmarked header never changes.
+
+Wrap the header line in markers on **their own lines**, around the `Version:` line
+**only**. WordPress's `get_file_data()` reads a header to the end of its line, so a
+marker on the `Version:` line itself shows up in **Appearance → Themes** as part of the
+version (`1.3.0 x-release-please-version` — checked against WordPress). And inside a
+start/end block the updater rewrites the first version-looking string on *every* line,
+so a block that also covers `Tested up to: 6.4.2` turns that into the release version
+too:
+
+```css
+/*
+Theme Name: LYH
+x-release-please-start-version
+Version: 1.2.3
+x-release-please-end
+*/
+```
+
+```php
+<?php
+/**
+ * Plugin Name:       LYH Welcome
+ * x-release-please-start-version
+ * Version:           1.2.3
+ * x-release-please-end
+ */
+
+define( 'LYH_WELCOME_VERSION', '1.2.3' ); // x-release-please-version
+```
+
+An inline marker is fine on a PHP constant, where nothing parses the rest of the line.
+With markers in place, what WordPress shows matches the tag — which is also why the
+release commit is worth deploying to staging rather than skipping.
+
+The template config lists `themes/THEME_NAME/style.css`. For a plugin, list its main
+file instead, or as well — `extra-files` takes several paths:
+
+```json
+"extra-files": ["themes/THEME_NAME/style.css", "plugins/PLUGIN_SLUG/PLUGIN_SLUG.php"]
+```
+
+The example lives here rather than in the template because release-please reads its
+config with plain `JSON.parse`, so a comment in that file fails the run. A path that
+does not exist — `THEME_NAME` left unedited, or `VERSION` not copied — does **not**
+fail it: release-please logs a warning and skips the file. Check that the first Release
+PR's diff touches the header file and `.github/VERSION`.
+
+### Versioning in a mixed repo
+
+When the deployable plugin is one folder in a repo that holds other things, scope
+release-please to that folder, so only commits touching it count:
+
+```json
+{
+  "release-type": "simple",
+  "include-v-in-tag": true,
+  "packages": {
+    "plugins/lyh-welcome": {
+      "include-component-in-tag": false,
+      "changelog-path": "CHANGELOG.md",
+      "version-file": "VERSION",
+      "extra-files": ["lyh-welcome.php"]
+    }
+  }
+}
+```
+
+with `.github/.release-please-manifest.json` set to `{ "plugins/lyh-welcome": "1.2.3" }`.
+
+- Only commits that touch a file under `plugins/lyh-welcome/` count toward its version
+  and changelog. A `feat:` that touches only the theme, or a sibling folder such as
+  `plugins/lyh-welcome-pro/`, does not.
+- `changelog-path`, `version-file` and `extra-files` resolve **relative to the package
+  folder**; prefix one with `/` to make it relative to the repo root. The package
+  needs its own `VERSION` file.
+- `include-component-in-tag: false` keeps the tags `vX.Y.Z`, which is what `prod.yaml`
+  deploys. Set to `true` — or misspelled, since release-please silently ignores an
+  unknown key — the tag becomes `<component>-vX.Y.Z`, and `prod.yaml` refuses it.
+
+### Repos that already have release tags
+
+Every repo that ran v1's prod workflow has `vX.Y.Z` tags and GitHub Releases. Copied
+unchanged, the template manifest (`0.0.0`) makes release-please propose `1.0.0` with the
+whole history in its changelog — a version that already exists. The first step of
+`release-please.yaml` refuses to run in that state, so this is the fix it points at:
+
+1. Find the newest tag: `git fetch --tags && git tag -l 'v*' --sort=-v:refname | head -1`.
+2. Set `.github/.release-please-manifest.json` to that version without the `v` —
+   `{ ".": "1.4.2" }` — and `.github/VERSION` to `1.4.2`.
+3. Replace `prod.yaml` with the v2 template **in the same PR**. v1's prod workflow tags
+   every merge; if it tags this one, the manifest is behind again. After the PR merges,
+   repeat step 1, and if there is a newer tag, update the manifest to it before merging
+   any Release PR. The guard step will say so if you forget.
+
+The first Release PR then proposes the next version — `1.4.3` or `1.5.0` — and lists
+only the commits since `v1.4.2`. release-please finds `v1.4.2` by its tag name, so the
+v1-created Release (or a bare tag) is enough.
+
+Do **not** use `bootstrap-sha` or `initial-version` for this: the first still proposes
+`1.0.0`, and the second ignores `feat`/`fix` and re-lists the whole history. If the
+newest tag's commit is not in the default branch's history
+(`git merge-base --is-ancestor v1.4.2 origin/main` fails), also set top-level
+`"last-release-sha"` to `git rev-list -n1 v1.4.2`, or the changelog re-lists everything.
 
 The rest of the mechanics — which types release and why, how to retitle a dependabot
 PR, the phantom-commit trap in PR descriptions — is the same as for this repo and is
@@ -280,21 +712,26 @@ Nothing breaks until you do this. `@v1` keeps working.
 
 Per repo, roughly ten minutes:
 
-1. **Add `release-please.yaml` and its two config files, and let it open a Release
-   PR.** Do this first and on its own. Production in v2 deploys from a tag, so
-   without this there is nothing to deploy from.
+1. **Add `release-please.yaml` and the release-please config files, and replace
+   `prod.yaml` with the v2 template, in one PR.** Do this first, and set the manifest
+   to the repo's newest v1 tag (see
+   [Repos that already have release tags](#repos-that-already-have-release-tags)).
+   They must land together: `release-please.yaml` calls `prod.yaml`, and a v1
+   `prod.yaml` has no `workflow_call` trigger. Production in v2 deploys a release, so
+   without this there is nothing to deploy.
 2. **Replace `stage.yaml`** with the v2 template. Note the trigger change: staging
    now deploys on merge, not on PR update.
-3. **Replace `prod.yaml`** with the v2 template. Delete the `major` / `minor` /
-   `patch` labels from the repo afterwards so nobody keeps applying them expecting
-   an effect.
+3. **Delete the `major` / `minor` / `patch` labels** from the repo. The v2 `prod.yaml`
+   from step 1 overwrote the v1 one at the same path and reads no labels, so nobody
+   should keep applying them expecting an effect.
 4. **Add `dev.yaml`** if the site has a dev install.
 5. **Remove the `WPE_INSTALL_ID` secret.** v2 resolves install ids by name.
 6. **Add the `WPE_DEV_ENV` variable** if you added `dev.yaml`.
+7. **Rehearse:** `gh workflow run stage.yaml --ref <default-branch> -f dry_run=true`.
 
 Then verify: open a throwaway PR and confirm it deploys to dev (or nowhere), merge it
-and confirm staging updates, and merge the Release PR and confirm the tag deploys
-production.
+and confirm staging updates, then merge the Release PR and confirm the same
+release-please run shows a `production` job that deploys the new tag.
 
 The v1 workflows stay for a reasonable window. They will be removed in `v3`, not
 before, and not while anything still pins `v1`.

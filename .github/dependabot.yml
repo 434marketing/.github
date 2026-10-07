@@ -1,7 +1,8 @@
 version: 2
 updates:
   # Keeps the actions used inside the reusable workflows current
-  # (actions/checkout, softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
+  # (actions/checkout, actions/setup-node, shivammathur/setup-php,
+  # softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
   # A bump here reaches every site on @v2 (and @v1) once it is released, so review
   # these PRs like any other change.
   - package-ecosystem: "github-actions"

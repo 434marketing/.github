@@ -1,18 +1,24 @@
 name: Release Please
 
-# VERSIONING FOR A CLIENT SITE REPO. This is the piece `prod.yaml` depends on:
-# it is what creates the vX.Y.Z tag that a production deploy triggers from.
+# VERSIONING FOR A CLIENT SITE REPO, AND THE START OF EVERY PRODUCTION DEPLOY.
 #
 # It runs on every push to the default branch and keeps ONE open pull request
 # titled `chore(main): release X.Y.Z`, which accumulates the pending changes and
 # shows the version they will cut. Merging that PR is the act of releasing: it
 # writes CHANGELOG.md, bumps .github/VERSION and the manifest, and creates the
-# git tag and the GitHub Release.
+# git tag and the GitHub Release. The `production` job below then CALLS
+# prod.yaml with that tag.
 #
-# NOTHING HERE DEPLOYS. It creates a tag; `prod.yaml` deploys that tag.
+# WHY A CALL: a tag created with GITHUB_TOKEN does not start other workflows, so
+# prod.yaml's `push: tags` trigger never sees a release-please tag. This is the
+# same pattern 434marketing/.github uses to move its own `v<major>` tag.
+#
+# THIS FILE NEEDS prod.yaml IN THE SAME REPO. A `uses:` that points at a missing
+# file fails this whole workflow at startup, Release PR included. Not live yet?
+# Add prod.yaml anyway and uncomment its NOT YET LIVE gate.
 #
 # BEFORE THIS WORKS, two files have to exist in the repo. Copy them from
-# `client-repo-templates/` in 434marketing/.github and edit the theme path:
+# `client-repo-templates/` in 434marketing/.github and edit the paths:
 #     .github/release-please-config.json
 #     .github/.release-please-manifest.json
 #
@@ -22,36 +28,89 @@ name: Release Please
 #
 # VERSION NUMBERS COME FROM COMMIT MESSAGES, NOT LABELS. With squash merging —
 # which is the normal path — the PR TITLE becomes the commit subject, so the PR
-# title is what decides the version. `feat:` cuts a minor, `fix:` a patch, a `!`
-# before the colon cuts a major, and `chore:`/`ci:`/`build:`/`test:`/`style:`
-# cut nothing at all.
+# title is what decides the version. `feat:` cuts a minor, a `!` before the
+# colon cuts a major, and `fix:`, `docs:`, `perf:`, `deps:`, `refactor:` and
+# `revert:` cut a patch. `chore:`/`ci:`/`build:`/`test:`/`style:` cut nothing —
+# and neither does any type the config does not list (`wip:`, `feature:`) or a
+# title that is not a conventional commit at all.
 #
 # THE FIRST RELEASE IS 1.0.0, not 0.1.0. With no prior release, release-please
 # skips the bump rules entirely and returns `initial-version`, which is 1.0.0 for
 # release-type `simple`. The commits behind the first Release PR decide its
 # changelog, not its number. For a new build that suits it: merge the first
-# Release PR when the site goes live.
+# Release PR when the site goes live. A repo that already has vX.Y.Z tags (every
+# repo that ran v1's prod workflow) must set the manifest to its newest tag
+# first — the first step below refuses to run until it does. See the README.
+#
+# THE THEME OR PLUGIN `Version:` HEADER only changes if it is wrapped in
+# release-please markers — listing the file in `extra-files` is not enough.
+#   style.css, or a plugin's main PHP file:
+#        * x-release-please-start-version
+#        * Version:           1.2.3
+#        * x-release-please-end
+#   a PHP constant:
+#       define( 'PLUGIN_VERSION', '1.2.3' ); // x-release-please-version
+# Never put the marker on the `Version:` line itself: WordPress reads that
+# header to the end of the line, and would show "1.2.3 x-release-please-version".
 
 on:
-  push:
-    branches:
-      - $default-branch
+  # No `branches:` filter, on purpose. GitHub's default-branch placeholder is
+  # only substituted when a workflow is created from the template in the Actions
+  # UI; a copied file keeps the literal and never runs, and a hard-coded `main`
+  # is wrong for the org's `master` and `develop` repos. The job's `if:` below
+  # does the filtering instead, so this file needs no per-repo edit. A push to
+  # any other branch shows up as a skipped run, which is the accepted cost.
+  push: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-please
+  # Per ref. `on: push` also fires for other branches, tags and branch
+  # deletions; with one shared group those skipped runs would displace a
+  # default-branch run left pending behind a long production deploy.
+  group: release-please-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   release-please:
     name: Maintain the Release PR
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
+    # All three are required by release-please-action v5. Without issues: write
+    # it cannot create the `autorelease: pending` label, which is how it finds a
+    # merged Release PR — so the release, and the production deploy, never happen.
     permissions:
       contents: write
+      issues: write
       pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      - uses: actions/checkout@v7
+
+      # A manifest behind the repo's own tags makes release-please propose a
+      # version that already exists: 1.0.0 in a repo that ran v1's prod
+      # workflow, or the tag v1 cut after the manifest was set. Merging that
+      # Release PR fails half-way, after the changelog is already committed.
+      - name: Refuse a manifest that is behind the tags
+        run: |
+          set -euo pipefail
+          MANIFEST=.github/.release-please-manifest.json
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error title=No release-please manifest::Copy .github/.release-please-manifest.json (and release-please-config.json) from client-repo-templates/ in 434marketing/.github."
+            exit 1
+          fi
+          CURRENT="$(jq -r '.[] | ltrimstr("v")' "$MANIFEST" | sort -V | tail -n1)"
+          NEWEST="$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/v##' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -n "$NEWEST" ] && [ "$(printf '%s\n%s\n' "$CURRENT" "$NEWEST" | sort -V | tail -n1)" != "$CURRENT" ]; then
+            echo "::error title=Manifest is behind the tags::The manifest says ${CURRENT}, but this repo already has v${NEWEST}. Set ${MANIFEST} (and .github/VERSION) to ${NEWEST}, so the next release is the one after it. See 'Repos that already have release tags' in the 434marketing/.github README."
+            exit 1
+          fi
+          echo "Manifest ${CURRENT}; newest release tag ${NEWEST:-none}."
+
       - name: Release Please
         id: release
         uses: googleapis/release-please-action@v5
@@ -61,11 +120,12 @@ jobs:
           # PAT and the Release PR becomes your own, which you cannot approve
           # yourself if the repo requires a review.
           #
-          # The trade-off worth knowing: a PR opened with GITHUB_TOKEN does NOT
-          # trigger `pull_request` workflows, so dev.yaml never deploys the
-          # Release PR. That is almost always what you want — the Release PR
-          # touches CHANGELOG.md, the version file and the manifest, and there is
-          # no PHP in it.
+          # The trade-offs worth knowing: a PR opened with GITHUB_TOKEN starts
+          # its `pull_request` runs only once someone approves them ("Approve
+          # workflows to run"). Leave dev.yaml's run on the Release PR
+          # unapproved — it touches only the changelog and version files. And a
+          # tag created with GITHUB_TOKEN does not trigger prod.yaml at all,
+          # which is why the `production` job below exists.
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
@@ -73,7 +133,7 @@ jobs:
       - name: Explain a permissions failure
         if: failure()
         run: |
-          echo "::error title=release-please failed::If the log says GitHub Actions is not permitted to create or approve pull requests, enable that setting in Settings -> Actions -> General."
+          echo "::error title=release-please failed::If the log says GitHub Actions is not permitted to create or approve pull requests, enable that setting in Settings -> Actions -> General. If it cannot create a label, the job is missing issues: write."
 
       - name: Summary
         if: success()
@@ -87,12 +147,26 @@ jobs:
             echo "### Release Please"
             echo ""
             if [ "${RELEASED}" = "true" ]; then
-              echo "Cut release **${TAG}**. If this repo has \`prod.yaml\`, that tag is deploying to production now."
+              echo "Cut release **${TAG}**. The \`production\` job in this run deploys it next."
             elif [ "${PRS}" = "true" ]; then
               echo "Release PR opened or updated. Merge it when you want to release."
             else
               echo "No releasable changes on this push."
               echo ""
-              echo "Only \`feat\`, \`fix\` and breaking changes cut a version. \`chore\`, \`ci\`, \`build\`, \`test\` and \`style\` do not — if this change alters what the site does, it wanted \`fix:\` or \`feat:\`."
+              echo "\`chore\`, \`ci\`, \`build\`, \`test\` and \`style\` cut nothing, and neither does a type the config does not list (\`wip:\`, \`feature:\`) or a title that is not a conventional commit. \`feat\` cuts a minor, a breaking change a major, and \`fix\`, \`docs\`, \`perf\`, \`deps\`, \`refactor\` and \`revert\` a patch — if this change alters what the site does, it wanted \`fix:\` or \`feat:\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The deploy. Without this the tag exists and nothing reaches production.
+  production:
+    name: Deploy the release to production
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    # What prod.yaml and the reusable deploy workflow need. A called workflow
+    # can never have more than its calling job grants.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/prod.yaml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit

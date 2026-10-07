@@ -1,10 +1,10 @@
 name: WP Engine Deploy (reusable)
 
-# ONE reusable workflow for every environment. It replaces the v1 pair
-# `wpe-deploy-staging.yml` / `wpe-deploy-prod.yml`, which differ only in
-# configuration — the install name, whether a backup is taken, and what happens
-# after the rsync. Configuration belongs in inputs, not in a second file that has
-# to be kept in step by hand.
+# ONE reusable workflow for every environment, and for themes, plugins and
+# mu-plugins alike. It replaces the v1 pair `wpe-deploy-staging.yml` /
+# `wpe-deploy-prod.yml`, which differ only in configuration — the install name,
+# whether a backup is taken, and what happens after the rsync. Configuration
+# belongs in inputs, not in a second file that has to be kept in step by hand.
 #
 #   jobs:
 #     deploy:
@@ -16,6 +16,9 @@ name: WP Engine Deploy (reusable)
 #         environment: staging
 #         backup: true
 #       secrets: inherit
+#
+# Several folders in one deploy (one backup, one ordered rsync per folder):
+# pass `targets` instead of src_path/remote_path. See the README.
 #
 # WHAT THIS WORKFLOW DELIBERATELY DOES NOT DO, unlike v1's prod workflow:
 # it does not tag, it does not cut a GitHub Release, and it does not read
@@ -31,13 +34,38 @@ on:
         required: true
         type: string
       src_path:
-        description: "Source path within the repo, e.g. themes/mytheme/. A trailing slash copies the CONTENTS of the directory; without one the directory itself is copied."
-        required: true
+        description: >-
+          Source path within the repo. A directory must end with `/` (its
+          CONTENTS are copied); `./` is a repo whose root is the plugin or theme.
+          A single file is also allowed — then remote_path is the destination
+          file. Leave empty when using `targets`.
+        required: false
+        default: ""
         type: string
       remote_path:
-        description: "Destination path on the install, e.g. wp-content/themes/mytheme/."
-        required: true
+        description: >-
+          Destination on the install, relative to the site root. For a directory:
+          exactly one folder, wp-content/plugins/<slug>/, wp-content/themes/<slug>/
+          or wp-content/mu-plugins/<pkg>/, with the trailing slash. Leave empty
+          when using `targets`.
+        required: false
+        default: ""
         type: string
+      targets:
+        description: >-
+          JSON array of {"src_path": "...", "remote_path": "..."} objects, deployed
+          one after another IN ARRAY ORDER after ONE lint pass and ONE backup.
+          Replaces src_path/remote_path. Stops at the first failed target. At most 6.
+        required: false
+        default: ""
+        type: string
+      allow_unsafe_remote_path:
+        description: >-
+          Bypass the preflight rule that a deploy must target one plugin, theme or
+          mu-plugin folder. The only bypass. Prints a warning on every run.
+        required: false
+        default: false
+        type: boolean
       environment:
         description: >-
           GitHub Environment to attribute the deployment to — dev, staging or
@@ -47,16 +75,16 @@ on:
         required: true
         type: string
       ref:
-        description: "Git ref or SHA to deploy. Defaults to the caller's ref, which is not always what you want — on a merged pull_request, pass the merge commit."
+        description: "Git ref or SHA to deploy. Defaults to the caller's ref, which is not always what you want — on a merged pull_request, pass the merge commit. Resolved to ONE commit in preflight; every later job uses that commit."
         required: false
         default: ""
         type: string
       version:
         description: >-
           Label to stamp on the WP Engine restore point. Optional: when empty the
-          backup is described as `<ref-name>@<short-sha>`, which is factual and
-          needs no git. This is a DESCRIPTION, never a release version — nothing
-          here computes or publishes a version number.
+          backup is described as `<branch>@<short-sha>` of the deployed commit,
+          which is factual and needs no git. This is a DESCRIPTION, never a
+          release version — nothing here computes or publishes a version number.
         required: false
         default: ""
         type: string
@@ -76,24 +104,34 @@ on:
         default: false
         type: boolean
       lint_paths:
-        description: "Space-separated paths to `php -l` before deploying. Empty string disables the lint gate."
+        description: "Space-separated paths to `php -l` before deploying. Empty string disables the lint gate. The default `.` lints the whole repo — set it in any repo that holds more than the code being deployed."
         required: false
         default: "."
         type: string
       php_version:
-        description: "PHP version for the lint gate. Match the install."
+        description: "PHP version for the lint gate (and for setup_composer). Match the install."
         required: false
         default: "8.2"
+        type: string
+      php_versions:
+        description: >-
+          JSON list of PHP versions to lint against, e.g. ["7.4","8.4"] for a
+          plugin with a support floor. Overrides php_version for the lint gate
+          and runs it once per version.
+        required: false
+        default: ""
         type: string
       rsync_flags:
         description: >-
           rsync flags. The default ADDS --delete (the action's own default never
-          deletes, so a file removed from git lives on forever) and OMITS
-          --inplace (see the long note at the deploy step). Setting this replaces
-          the whole string, so re-state -azvr and the excludes.
+          deletes, so a file removed from git lives on forever), ADDS
+          --delay-updates --delete-delay (all updates land together at the end)
+          and OMITS --inplace (see the long note at the deploy step). Setting
+          this replaces the whole string, so re-state -azvr and the excludes —
+          or keep the default and use extra_excludes.
         required: false
         default: >-
-          -azvr --delete
+          -azvr --delete --delay-updates --delete-delay
           --exclude=.*
           --exclude=node_modules
           --exclude=package.json
@@ -104,13 +142,63 @@ on:
           --exclude=gulpfile.js
           --exclude=postcss.config.js
         type: string
+      extra_excludes:
+        description: >-
+          Space-separated rsync exclude patterns APPENDED to rsync_flags as
+          --exclude=<pattern>, so the defaults are kept. Anchor with a leading
+          `/` to match only at the top of src_path, e.g. "/README.md /docs/".
+        required: false
+        default: ""
+        type: string
+      build_command:
+        description: >-
+          Shell command run from the repo root after checkout and before the
+          rsync, e.g. "composer install --no-dev --optimize-autoloader" or
+          "npm ci && npm run build". The built tree is what is deployed.
+        required: false
+        default: ""
+        type: string
+      setup_node:
+        description: "Node version to install for build_command, e.g. \"20\". Empty skips it."
+        required: false
+        default: ""
+        type: string
+      setup_composer:
+        description: "Install PHP (php_version) and Composer for build_command."
+        required: false
+        default: false
+        type: boolean
+      post_deploy_script:
+        description: >-
+          Path of a script, relative to the SITE ROOT and INSIDE a deployed
+          folder, e.g. wp-content/plugins/<slug>/bin/post-deploy.sh. Run with
+          bash on the install after the last target; a non-zero exit fails the
+          deploy.
+        required: false
+        default: ""
+        type: string
+      smoke_wp_cli:
+        description: "After deploying, run `wp eval` on the install over SSH. Any fatal in an active plugin, mu-plugin or theme fails the run."
+        required: false
+        default: false
+        type: boolean
+      require_active_plugin:
+        description: "Plugin slug that must be active after the deploy (`wp plugin is-active`). Catches a renamed main file, which silently deactivates a plugin."
+        required: false
+        default: ""
+        type: string
+      smoke_urls:
+        description: "Space-separated paths, e.g. \"/ /wp-login.php\". Each is fetched from https://<install>.wpenginepowered.com after the deploy, following redirects; anything but a final 2xx fails the run."
+        required: false
+        default: ""
+        type: string
       cache_clear:
-        description: "Flush WP Engine page and CDN cache after the deploy."
+        description: "Flush WP Engine page and CDN cache after the deploy (once, after the last target)."
         required: false
         default: true
         type: boolean
       dry_run:
-        description: "Lint and resolve the install, then stop. Nothing is backed up and nothing is written. Use it to rehearse against an install this repo has never deployed to."
+        description: "Preflight, lint and resolve the install, then stop. Nothing is backed up and nothing is written. Use it to rehearse against an install this repo has never deployed to."
         required: false
         default: false
         type: boolean
@@ -125,7 +213,7 @@ on:
         description: "WP Engine API password. Only needed when backup is true."
         required: false
       SLACK_WEBHOOK_URL:
-        description: "Optional. If set, a failed deploy posts to this webhook."
+        description: "Optional. If set, a failed deploy — or a cancelled production deploy — posts to this webhook."
         required: false
 
 permissions:
@@ -133,20 +221,440 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. LINT — the cheap hard gate. Runs before anything touches the install, so
-  #    a syntax error never costs a backup or a half-applied rsync.
+  # 0. PREFLIGHT — fail closed on a deploy shape that would wipe or misplace code.
+  #
+  #    The deploy action's own protection is a fixed exclude list that applies
+  #    only when REMOTE_PATH is spelled EXACTLY '', '.', 'wp-content(/)' or
+  #    'wp-content/mu-plugins(/)', and nothing bounds --delete. Each of these
+  #    was reproduced exiting rsync 0 — a green deploy:
+  #      plugins/<slug>/ -> wp-content/plugins/   deletes every other plugin
+  #      plugins/        -> wp-content/plugins/   deletes plugins not in git and
+  #                                               overwrites third-party ones
+  #      plugins/<slug>  -> wp-content/plugins/<slug>/   (no trailing slash)
+  #                                               ships into <slug>/<slug>/ and
+  #                                               the old code keeps running
+  #    So the rules live here, and they run BEFORE lint and backup. The same
+  #    step runs again in the deploy job after the build (YAML anchor below), so
+  #    the tree that is checked is the tree that ships.
+  #
+  #    It also pins the run to ONE commit: `ref` may be a branch that moves
+  #    during a 30-minute backup wait, so lint and deploy check out the SHA
+  #    resolved here, never `ref` again.
   # ---------------------------------------------------------------------------
-  lint:
-    name: PHP syntax lint
-    if: inputs.lint_paths != ''
+  preflight:
+    name: Preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.preflight.outputs.targets }}
+      count: ${{ steps.preflight.outputs.count }}
+      flags: ${{ steps.preflight.outputs.flags }}
+      php_versions: ${{ steps.preflight.outputs.php_versions }}
+      sha: ${{ steps.preflight.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+
+      - &preflight
+        name: Preflight — validate what will be deployed
+        id: preflight
+        env:
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ inputs.src_path }}
+          REMOTE_PATH: ${{ inputs.remote_path }}
+          TARGETS: ${{ inputs.targets }}
+          ALLOW_UNSAFE: ${{ inputs.allow_unsafe_remote_path }}
+          RSYNC_FLAGS: ${{ inputs.rsync_flags }}
+          EXTRA_EXCLUDES: ${{ inputs.extra_excludes }}
+          LINT_PATHS: ${{ inputs.lint_paths }}
+          PHP_VERSION: ${{ inputs.php_version }}
+          PHP_VERSIONS: ${{ inputs.php_versions }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
+          POST_DEPLOY_SCRIPT: ${{ inputs.post_deploy_script }}
+          REQUIRE_ACTIVE_PLUGIN: ${{ inputs.require_active_plugin }}
+          SMOKE_URLS: ${{ inputs.smoke_urls }}
+        run: |
+          set -euo pipefail
+
+          # pre  = the preflight job: the commit as checked out, before any build.
+          # post = the deploy job, after build_command: the tree that ships. The deploy
+          #        job sets PREFLIGHT_STAGE=post through $GITHUB_ENV before this runs.
+          STAGE="${PREFLIGHT_STAGE:-pre}"
+          MAX_TARGETS=6
+          ERRORS=0
+          # Input values end up in these messages, and a newline in one would start a
+          # new workflow command. Escape the message the way the runner expects.
+          esc()   { local m="$*"; m="${m//%/%25}"; m="${m//$'\r'/%0D}"; m="${m//$'\n'/%0A}"; printf '%s' "$m"; }
+          err()   { echo "::error title=Preflight::$(esc "$*")"; ERRORS=$((ERRORS + 1)); }
+          warn()  { echo "::warning title=Preflight::$(esc "$*")"; }
+          # A path the build will create cannot be checked before the build runs.
+          deferred() { [ "$STAGE" = pre ] && [ -n "$BUILD_COMMAND" ]; }
+          defer() { echo "::notice title=Preflight::$(esc "$*") Re-checked after build_command, before anything is written."; }
+          # Split a space- or newline-separated input into words. `read -a` alone stops
+          # at the first newline, and a `|` block in the caller's `with:` has several.
+          words() { local -n _out="$1"; _out=(); read -r -d '' -a _out <<< "$2" || true; }
+
+          # Install name. An unset WPE_STAGE_ENV/WPE_PROD_ENV variable arrives here as
+          # an empty string, which is worth naming before anything else.
+          if ! [[ "$WPE_ENV" =~ ^[a-z0-9]+$ ]]; then
+            err "wpe_env '${WPE_ENV}' is not a WP Engine install name. If it is empty, the WPE_DEV_ENV / WPE_STAGE_ENV / WPE_PROD_ENV variable this caller reads is not set — and it must be a repository or organization variable, not an environment one."
+          fi
+
+          # --- Effective rsync flags: rsync_flags + extra_excludes ---------------------
+          FLAGS="$(printf '%s' "$RSYNC_FLAGS" | tr '\r\n' '  ')"
+          if [ -z "${FLAGS//[[:space:]]/}" ]; then
+            err "rsync_flags is empty. The deploy action would then substitute its own default, -azvr --inplace, which this workflow exists to avoid."
+          fi
+          words EXCLUDES "$EXTRA_EXCLUDES"
+          for p in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            case "$p" in
+              *[\'\"\\]*) err "extra_excludes: '${p}' contains a quote or backslash. The deploy action re-parses the flags with xargs, which would mangle it." ;;
+              *) FLAGS="${FLAGS} --exclude=${p}" ;;
+            esac
+          done
+
+          # Parse the flags EXACTLY as the deploy action does (utils/functions.sh
+          # parse_flags: xargs, which honours quotes), so a check here sees the same
+          # argv rsync will.
+          ARGS=()
+          if printf '%s' "$FLAGS" | xargs printf '%s\0' > "${RUNNER_TEMP}/flags.bin"; then
+            mapfile -d '' ARGS < "${RUNNER_TEMP}/flags.bin"
+          else
+            err "rsync flags do not parse (an unbalanced quote?): ${FLAGS}"
+          fi
+          HAS_DELETE=false; HAS_PROTECT=false; HAS_INPLACE=false; HAS_DELAY=false
+          RISKY_RULE=""
+          for a in ${ARGS[@]+"${ARGS[@]}"}; do
+            case "$a" in
+              # A word that is not an option becomes an extra rsync SOURCE, placed
+              # before src_path — another folder merged into this one, green. Usually
+              # a typo like `--exclude=foo bar`.
+              '')  [ -z "${FLAGS//[[:space:]]/}" ] || err "rsync_flags contains an empty argument ('')." ;;
+              --)  err "rsync_flags may not contain a bare '--'." ;;
+              -*)  ;;
+              *)   err "rsync_flags contains '${a}', which is not an option, so rsync would treat it as an extra source and deploy it too. Write options as --name=value." ;;
+            esac
+            case "$a" in
+              --delete-excluded)
+                err "--delete-excluded deletes server files that MATCH an exclude — which includes the deploy action's own protections (uploads/, wp-config.php, WP Engine's mu-plugins). It is not supported." ;;
+              --del|--delete|--delete-*) HAS_DELETE=true ;;
+              --inplace|--append|--append-verify) HAS_INPLACE=true ;;
+              --delay-updates) HAS_DELAY=true ;;
+            esac
+            # rsync applies the FIRST filter rule that matches. A protect rule
+            # therefore only protects if no earlier rule could make a top-level
+            # entry deletable: an include, a risk rule, or a rules file. Excludes
+            # are harmless here; an excluded file is never deleted either.
+            case "$a" in
+              "--filter=P /*"|"--filter=protect /*"|"-fP /*")
+                [ -n "$RISKY_RULE" ] || HAS_PROTECT=true ;;
+              "--filter=- "*|"--filter=exclude "*|"-f- "*|"-fexclude "*) ;;
+              --filter=*|-f*|--include=*|--include-from=*|--exclude-from=*)
+                [ -n "$RISKY_RULE" ] || RISKY_RULE="$a" ;;
+            esac
+          done
+          if [ -n "$RISKY_RULE" ] && [ "$HAS_PROTECT" = false ]; then
+            case "$FLAGS" in *"P /*"*|*"protect /*"*)
+              warn "--filter='P /*' comes after '${RISKY_RULE}', which rsync applies first, so it protects nothing. Put it before every include, risk rule and rules file." ;;
+            esac
+          fi
+          if [ "$HAS_INPLACE" = true ] && [ "$HAS_DELAY" = true ]; then
+            err "rsync refuses --inplace (or --append) together with --delay-updates. Drop --inplace; see the README's rsync section for why it should never be used on a live site."
+          elif [ "$HAS_INPLACE" = true ]; then
+            warn "rsync_flags contains --inplace: live files are rewritten byte by byte, and a request landing mid-write can execute a truncated PHP file. See the README's rsync section."
+          fi
+
+          # --- Normalise src_path/remote_path or targets into one list ----------------
+          # --argjson, not a pipe into jq: jq reads a STREAM from stdin, so two
+          # concatenated arrays would pass the shape check as two documents.
+          T='[]'
+          if [ -n "$TARGETS" ]; then
+            if [ -n "$SRC_PATH" ] || [ -n "$REMOTE_PATH" ]; then
+              err "Set either targets or src_path/remote_path, not both."
+            fi
+            if ! T="$(jq -cn --argjson t "$TARGETS" '$t |
+                if type == "array" and length > 0
+                   and all(.[]; type == "object"
+                                and (.src_path | type) == "string"
+                                and (.remote_path | type) == "string")
+                then map({src_path, remote_path}) else error("shape") end' 2>/dev/null)"; then
+              err 'targets must be ONE non-empty JSON array of {"src_path": "…", "remote_path": "…"} objects.'
+              T='[]'
+            fi
+          elif [ -z "$SRC_PATH" ] || [ -z "$REMOTE_PATH" ]; then
+            err "src_path and remote_path are both required when targets is not set."
+          else
+            T="$(jq -cn --arg s "$SRC_PATH" --arg r "$REMOTE_PATH" '[{src_path: $s, remote_path: $r}]')"
+          fi
+          COUNT="$(jq 'length' <<< "$T")"
+          if [ "$COUNT" -gt "$MAX_TARGETS" ]; then
+            err "${COUNT} targets; at most ${MAX_TARGETS} are supported in one deploy."
+          fi
+
+          # The first 8 KiB, as WordPress reads it, with a non-empty value: get_plugins()
+          # skips a plugin whose Name is empty.
+          has_header() {  # <file> <header>
+            head -c 8192 -- "$1" | grep -Eiq "^([[:blank:]]*<\?php)?[[:blank:]/*#@]*$2:[[:blank:]]*[^[:blank:]*]"
+          }
+
+          DIR_SRCS=(); DIR_DESTS=(); ALL_DESTS=(); KINDS=()
+          check_target() {
+            local n="$1" src="$2" dest="$3" where kind
+            where="target ${n} (${src} → ${dest})"
+
+            case "$src" in ''|*[!A-Za-z0-9._/@+-]*)
+              err "${where}: src_path is empty or contains a character other than letters, digits and . _ / @ + -"; return ;; esac
+            case "$dest" in ''|*[!A-Za-z0-9._/@+-]*)
+              err "${where}: remote_path is empty or contains a character other than letters, digits and . _ / @ + -. For the site root use '.'"; return ;; esac
+            case "$src" in
+              -*) err "${where}: src_path may not start with '-'; rsync would read it as an option."; return ;;
+              /*) err "${where}: src_path must be relative to the repo root."; return ;;
+            esac
+            case "/${src}/" in */../*) err "${where}: src_path may not contain a '..' segment."; return ;; esac
+
+            # Rule 1 — canonical remote_path. The action's protections are an exact
+            # string match, so './wp-content/mu-plugins/' or 'wp-content//mu-plugins/'
+            # silently switch them off.
+            case "$dest" in
+              /*)   err "${where}: remote_path must be relative to the site root — no leading '/'."; return ;;
+              ./*)  err "${where}: remote_path may not start with './'."; return ;;
+              *//*) err "${where}: remote_path may not contain '//'."; return ;;
+            esac
+            case "/${dest}/" in
+              */../*) err "${where}: remote_path may not contain a '..' segment."; return ;;
+              */./*) if [ "$dest" != "." ]; then err "${where}: remote_path may not contain a '.' segment."; return; fi ;;
+            esac
+
+            # Rule 2 — src_path exists in the commit being deployed. A path the build
+            # will create is checked after the build; until then its kind is what
+            # remote_path says, so the destination rules below still run now, before
+            # lint and backup.
+            local pending=false
+            if [ -e "$src" ]; then
+              :
+            elif deferred; then
+              defer "${where}: src_path does not exist yet."
+              pending=true
+            else
+              err "${where}: src_path does not exist in $(git rev-parse --short HEAD)."; return
+            fi
+
+            # Rule 3 — the trailing slash decides WHERE rsync puts things.
+            if [ "$pending" = true ]; then
+              case "$dest" in */|.) kind="dir" ;; *) kind="file" ;; esac
+            elif [ -d "$src" ]; then
+              kind="dir"
+              case "$src" in */) ;; *)
+                err "${where}: src_path is a directory, so it must end with '/'. Without it rsync copies the directory itself and the code lands one level too deep (${dest%/}/$(basename -- "$src")/) while the old code keeps running. Use '${src}/' — or './' for a repo whose root is the plugin."
+                return ;;
+              esac
+            elif [ -f "$src" ]; then
+              kind="file"
+            else
+              err "${where}: src_path is neither a regular file nor a directory."; return
+            fi
+            if [ "$kind" = file ]; then
+              case "$dest" in */|.)
+                err "${where}: src_path is a file, so remote_path must be the destination FILE, ending in '$(basename -- "$src")'."; return ;;
+              esac
+              if [ "${dest##*/}" != "${src##*/}" ]; then
+                err "${where}: a single-file deploy must keep its name: remote_path should end in '$(basename -- "$src")'."; return
+              fi
+            fi
+
+            # Rule 4 — never --delete a shared root. A root holds things this repo does
+            # not own: other plugins, third-party themes, WP Engine's own mu-plugins
+            # (the action's exclude list names only 12 of them).
+            if [ "$HAS_DELETE" = true ] && [ "$kind" = dir ]; then
+              case "${dest%/}" in ''|.|wp-content|wp-content/plugins|wp-content/themes|wp-content/mu-plugins|wp-content/uploads)
+                if [ "$HAS_PROTECT" != true ]; then
+                  err "${where}: --delete into '${dest}' removes everything there that this repo does not contain — every other plugin, theme or mu-plugin. Deploy one folder (wp-content/<plugins|themes|mu-plugins>/<slug>/). For a root deploy you really mean, add --filter='P /*' to rsync_flags BEFORE any include rule, so nothing at the top level is ever deleted, and set allow_unsafe_remote_path."
+                fi ;;
+              esac
+            fi
+
+            # Rule 5 — one folder per deploy, or an explicit, logged bypass.
+            if [ "$kind" = dir ]; then
+              if ! [[ "$dest" =~ ^wp-content/(plugins|themes|mu-plugins)/[^/]+/$ ]]; then
+                if [ "$ALLOW_UNSAFE" = true ]; then
+                  warn "${where}: remote_path is not a single plugin, theme or mu-plugin folder. Allowed only because allow_unsafe_remote_path is true."
+                else
+                  err "${where}: a directory deploy must target exactly one folder — wp-content/plugins/<slug>/, wp-content/themes/<slug>/ or wp-content/mu-plugins/<pkg>/, with the trailing slash. Set allow_unsafe_remote_path: true to deploy anywhere else."
+                fi
+              fi
+            elif ! [[ "$dest" =~ ^wp-content/(plugins|themes|mu-plugins)/([^/]+/)*[^/]+$ ]]; then
+              if [ "$ALLOW_UNSAFE" = true ]; then
+                warn "${where}: a single file outside wp-content/plugins, themes or mu-plugins. Allowed only because allow_unsafe_remote_path is true."
+              else
+                err "${where}: a single-file deploy must land under wp-content/plugins/, wp-content/themes/ or wp-content/mu-plugins/. Set allow_unsafe_remote_path: true to deploy anywhere else."
+              fi
+            fi
+
+            ALL_DESTS+=("$dest"); KINDS+=("$kind")
+            if [ "$kind" = dir ]; then DIR_SRCS+=("$src"); DIR_DESTS+=("$dest"); fi
+            [ "$pending" = false ] || return 0
+
+            # Rule 6 — the folder is what remote_path says it is. A plugin folder with
+            # no header file is not a plugin to WordPress, and a theme folder with no
+            # style.css is not a theme.
+            if [ "$kind" = dir ]; then
+              local missing=""
+              if [[ "$dest" =~ ^wp-content/plugins/[^/]+/$ ]]; then
+                local f found=false
+                for f in "${src}"*.php; do
+                  if [ -f "$f" ] && has_header "$f" "Plugin Name"; then found=true; break; fi
+                done
+                [ "$found" = true ] || missing="no *.php file directly in '${src}' carries a non-empty 'Plugin Name:' header"
+              elif [[ "$dest" =~ ^wp-content/themes/[^/]+/$ ]]; then
+                if ! { [ -f "${src}style.css" ] && has_header "${src}style.css" "Theme Name"; }; then
+                  missing="'${src}style.css' is missing or has no non-empty 'Theme Name:' header"
+                fi
+              fi
+              if [ -n "$missing" ]; then
+                if deferred; then defer "${where}: ${missing}."
+                elif [ "$ALLOW_UNSAFE" = true ]; then warn "${where}: ${missing}. Allowed only because allow_unsafe_remote_path is true."
+                else err "${where}: ${missing}, so WordPress would not see what remote_path claims is there. Wrong src_path?"
+                fi
+              fi
+            fi
+
+            # Rule 7 — the action's own PHP_LINT runs `find "$SRC_PATH"/`, which finds
+            # nothing when SRC_PATH is a file and still prints success. The lint job is
+            # the only lint a single file gets.
+            if [ "$kind" = file ] && [[ "$src" == *.php ]]; then
+              local lp l s="${src#./}" covered=false
+              local -a lps
+              words lps "$LINT_PATHS"
+              for lp in ${lps[@]+"${lps[@]}"}; do
+                l="${lp#./}"; l="${l%/}"
+                if [ -z "$l" ] || [ "$l" = "." ] || [ "$l" = "$s" ] || [[ "$s" == "$l"/* ]]; then covered=true; fi
+              done
+              [ "$covered" = true ] || err "${where}: lint_paths must include '${src}'. The deploy action lints a directory, so a single-file deploy is otherwise never linted at all — and an mu-plugin fatal takes the whole site down with no recovery mode."
+            fi
+          }
+
+          # Read each value with a trailing sentinel: $( ) strips trailing newlines, and
+          # the checks must see exactly the string that would ship.
+          for ((i = 0; i < COUNT && i < MAX_TARGETS; i++)); do
+            s="$(jq -r --argjson i "$i" '.[$i].src_path + "#"' <<< "$T")"; s="${s%#}"
+            r="$(jq -r --argjson i "$i" '.[$i].remote_path + "#"' <<< "$T")"; r="${r%#}"
+            check_target "$((i + 1))" "$s" "$r"
+          done
+
+          # --- Across targets -----------------------------------------------------------
+          for ((i = 0; i < ${#ALL_DESTS[@]}; i++)); do
+            for ((j = i + 1; j < ${#ALL_DESTS[@]}; j++)); do
+              a="${ALL_DESTS[$i]}"; b="${ALL_DESTS[$j]}"
+              if [ "$a" = "$b" ]; then
+                err "Two targets deploy to '${a}'."
+              elif [ "$HAS_DELETE" = true ] && { [[ "$b" == "$a"* && "$a" == */ ]] || [[ "$a" == "$b"* && "$b" == */ ]]; }; then
+                err "Targets '${a}' and '${b}' nest; with --delete the outer one deletes the inner one's files on every deploy."
+              fi
+            done
+          done
+          # An mu-plugin loader that runs before its folder exists fatals the site.
+          for ((i = 0; i < ${#ALL_DESTS[@]}; i++)); do
+            if [ "${KINDS[$i]}" = file ] && [[ "${ALL_DESTS[$i]}" =~ ^wp-content/mu-plugins/[^/]+$ ]]; then
+              for ((j = i + 1; j < ${#ALL_DESTS[@]}; j++)); do
+                if [ "${KINDS[$j]}" = dir ] && [[ "${ALL_DESTS[$j]}" == wp-content/mu-plugins/* ]]; then
+                  warn "The mu-plugin loader '${ALL_DESTS[$i]}' deploys before the folder '${ALL_DESTS[$j]}'. List the folder first, so the loader never runs against code that is not there yet."
+                fi
+              done
+            fi
+          done
+
+          # --- Post-deploy options --------------------------------------------------------
+          if [ -n "$POST_DEPLOY_SCRIPT" ]; then
+            S="$POST_DEPLOY_SCRIPT"
+            if ! [[ "$S" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$S" == /* ]] || [[ "$S" == -* ]] || [[ "/${S}/" == */../* ]]; then
+              err "post_deploy_script '${S}' must be a plain relative path (letters, digits, . _ / -) from the site root."
+            else
+              inside=false
+              for ((i = 0; i < ${#DIR_DESTS[@]}; i++)); do
+                d="${DIR_DESTS[$i]}"
+                if [[ "$S" == "$d"* ]]; then
+                  inside=true
+                  local_copy="${DIR_SRCS[$i]}${S#"$d"}"
+                  if [ ! -f "$local_copy" ]; then
+                    if deferred; then defer "post_deploy_script: '${local_copy}' does not exist yet."
+                    else err "post_deploy_script '${S}' maps to '${local_copy}' in the repo, which does not exist."
+                    fi
+                  fi
+                fi
+              done
+              [ "$inside" = true ] || err "post_deploy_script '${S}' must be inside a deployed folder, given from the site root (e.g. wp-content/plugins/<slug>/bin/post-deploy.sh), so this deploy's rsync refreshes it. The deploy action never re-uploads a script that already exists on the server."
+            fi
+          fi
+          if [ -n "$REQUIRE_ACTIVE_PLUGIN" ] && ! [[ "$REQUIRE_ACTIVE_PLUGIN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            err "require_active_plugin '${REQUIRE_ACTIVE_PLUGIN}' is not a plugin slug."
+          fi
+          words URLS "$SMOKE_URLS"
+          for u in ${URLS[@]+"${URLS[@]}"}; do
+            [[ "$u" == /* ]] || err "smoke_urls: '${u}' must be a path starting with '/'."
+          done
+
+          # --- PHP versions for the lint matrix ---------------------------------------------
+          if [ -n "$PHP_VERSIONS" ]; then
+            if ! PHPV="$(jq -cn --argjson v "$PHP_VERSIONS" '$v |
+                if type == "array" and length > 0
+                   and all(.[]; type == "string" and test("^[0-9]+\\.[0-9]+$"))
+                then . else error("shape") end' 2>/dev/null)"; then
+              err "php_versions must be ONE JSON list of \"X.Y\" strings, e.g. [\"7.4\",\"8.4\"]."
+              PHPV='[]'
+            fi
+          else
+            PHPV="$(jq -cn --arg v "$PHP_VERSION" '[$v]')"
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+          {
+            echo "targets=${T}"
+            echo "count=${COUNT}"
+            echo "flags=${FLAGS}"
+            echo "php_versions=${PHPV}"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            if [ "$STAGE" = pre ]; then
+              echo "::error title=Preflight failed::${ERRORS} problem(s) above. Nothing was linted, backed up or deployed."
+            else
+              echo "::error title=Preflight failed after the build::${ERRORS} problem(s) above. Nothing was deployed."
+            fi
+            exit 1
+          fi
+
+          if [ "$STAGE" = pre ]; then
+            {
+              echo "### Preflight passed"
+              echo ""
+              echo "Commit \`${SHA}\`. Deploy order:"
+              echo ""
+              jq -r 'to_entries[] | "\(.key + 1). `\(.value.src_path)` → `\(.value.remote_path)`"' <<< "$T"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 1. LINT — the cheap hard gate. Runs before anything touches the install, so
+  #    a syntax error never costs a backup or a half-applied rsync.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: PHP syntax lint (${{ matrix.php }})
+    needs: [preflight]
+    if: inputs.lint_paths != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(needs.preflight.outputs.php_versions) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: ${{ inputs.php_version }}
+          php-version: ${{ matrix.php }}
       - name: php -l
         env:
           LINT_PATHS: ${{ inputs.lint_paths }}
@@ -169,10 +677,16 @@ jobs:
   # ---------------------------------------------------------------------------
   backup:
     name: WP Engine restore point
-    needs: [lint]
-    # always() so a disabled lint gate (skipped, not failed) does not cancel this.
-    if: always() && inputs.backup && !inputs.dry_run && needs.lint.result != 'failure'
+    needs: [preflight, lint]
+    # !cancelled(), not always(): always() also runs after a cancellation, and a
+    # cancelled lint is not a passed lint. A SKIPPED lint (lint_paths '') is fine.
+    if: >-
+      ${{ !cancelled() && inputs.backup && !inputs.dry_run
+          && needs.preflight.result == 'success'
+          && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
+    # The poll below gives up after 30 minutes; this is the backstop.
+    timeout-minutes: 45
     outputs:
       status: ${{ steps.backup.outputs.status }}
     steps:
@@ -193,6 +707,10 @@ jobs:
           VERSION: ${{ inputs.version }}
           REQUIRED: ${{ inputs.backup_required }}
           WAIT: ${{ inputs.backup_wait }}
+          # The commit preflight resolved, which is the commit that deploys.
+          SHA: ${{ needs.preflight.outputs.sha }}
+          # The branch a merged PR landed on, not GitHub's `<n>/merge` test ref.
+          REF_LABEL: ${{ github.base_ref || github.ref_name }}
         run: |
           set -euo pipefail
 
@@ -224,6 +742,23 @@ jobs:
           trap 'rm -f "$CFG"' EXIT
           API="https://api.wpengineapi.com/v1"
 
+          # GET that fails on an HTTP error OR a body that is not a JSON object.
+          # Without both checks an HTML 5xx page reaches jq, jq exits non-zero
+          # under `set -e`, and the step dies — even with backup_required false,
+          # which is how a WP Engine API blip used to block staging.
+          api_get() {
+            local body
+            if ! body="$(curl -sS --fail-with-body --retry 2 --retry-delay 5 --config "$CFG" "$1")"; then
+              printf '%s\n' "$body" | head -c 500 >&2; echo >&2
+              return 1
+            fi
+            if ! printf '%s' "$body" | jq -e 'type == "object"' > /dev/null 2>&1; then
+              echo "Not a JSON object: $(printf '%s' "$body" | head -c 200)" >&2
+              return 1
+            fi
+            printf '%s' "$body"
+          }
+
           # Resolve the install UUID from its NAME.
           #
           # This is what removes v1's WPE_INSTALL_ID secret. An install id is
@@ -235,7 +770,8 @@ jobs:
           INSTALL_ID=""
           OFFSET=0
           while [ "$OFFSET" -le 1000 ]; do
-            PAGE="$(curl -sS --config "$CFG" "${API}/installs?limit=100&offset=${OFFSET}")"
+            PAGE="$(api_get "${API}/installs?limit=100&offset=${OFFSET}")" \
+              || fail_or_warn "The WP Engine API install lookup failed (see the log above), so no restore point could be requested."
             INSTALL_ID="$(printf '%s' "$PAGE" | jq -r --arg n "$INSTALL_NAME" \
               '(.results // [])[] | select(.name == $n) | .id' | head -n1)"
             [ -n "$INSTALL_ID" ] && break
@@ -248,9 +784,9 @@ jobs:
             fail_or_warn "No install named '${INSTALL_NAME}' is visible to these credentials — either the wpe_env input is wrong or the credentials belong to a different WP Engine account. Note that an account without API access enabled sees no installs at all."
           fi
 
-          # Fall back to facts rather than to a guessed version. GITHUB_REF_NAME is
-          # the tag on a tag-triggered prod deploy and the branch otherwise.
-          LABEL="${VERSION:-${GITHUB_REF_NAME}@${GITHUB_SHA:0:7}}"
+          # Fall back to facts rather than to a guessed version: the branch and
+          # the commit that is about to deploy.
+          LABEL="${VERSION:-${REF_LABEL}@${SHA:0:7}}"
           DESC="$(printf '%s · %s · %s' "$INSTALL_NAME" "$LABEL" "$GITHUB_REPOSITORY" | LC_ALL=C tr -cd '\11\40-\176' | cut -c1-240)"
 
           # jq builds the JSON, so quotes, backslashes, backticks or $( ) in a
@@ -279,11 +815,14 @@ jobs:
           # variable printed an error and the deploy proceeded as though it had a
           # restore point. Check the code.
           if [ "$HTTP" -ne 0 ] || [ "$CODE" != "202" ]; then
-            jq -r '.message? // empty' "${RUNNER_TEMP}/resp.json" || true
+            jq -r '.message? // empty' "${RUNNER_TEMP}/resp.json" 2>/dev/null || head -c 500 "${RUNNER_TEMP}/resp.json" || true
             fail_or_warn "WP Engine returned HTTP ${CODE} for the backup request."
           fi
 
-          BACKUP_ID="$(jq -r '.id // "unknown"' "${RUNNER_TEMP}/resp.json")"
+          BACKUP_ID="$(jq -r '.id // empty' "${RUNNER_TEMP}/resp.json" 2>/dev/null || true)"
+          if [ -z "$BACKUP_ID" ]; then
+            fail_or_warn "WP Engine accepted the backup request but returned no backup id, so it cannot be confirmed."
+          fi
           echo "status=taken" >> "$GITHUB_OUTPUT"
           {
             echo "### Pre-deploy restore point"
@@ -295,14 +834,24 @@ jobs:
 
           # 202 Accepted means REQUESTED, not finished.
           if [ "$WAIT" != "true" ]; then
-            echo "::notice title=Backup requested, not awaited::backup_wait is false, so the snapshot runs concurrently with the rsync. It is a restore point for the database and uploads, not a byte-exact pre-deploy snapshot of the theme. Git holds the theme."
+            echo "::notice title=Backup requested, not awaited::backup_wait is false, so the snapshot runs concurrently with the rsync. It is a restore point for the database and uploads, not a byte-exact pre-deploy snapshot of the code. Git holds the code."
             exit 0
           fi
 
+          # A poll that fails is not a backup that failed. Tolerate a few in a
+          # row, so one API blip in a 30-minute wait does not fail production.
           DEADLINE=$(( SECONDS + 1800 ))
+          MISSES=0
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
             sleep 30
-            STATUS="$(curl -sS --config "$CFG" "${API}/installs/${INSTALL_ID}/backups/${BACKUP_ID}" | jq -r '.status // "unknown"')"
+            if ! RESP="$(api_get "${API}/installs/${INSTALL_ID}/backups/${BACKUP_ID}")"; then
+              MISSES=$((MISSES + 1))
+              echo "status poll failed (${MISSES} in a row)"
+              [ "$MISSES" -ge 5 ] && fail_or_warn "Lost track of backup ${BACKUP_ID}: five status polls in a row failed."
+              continue
+            fi
+            MISSES=0
+            STATUS="$(printf '%s' "$RESP" | jq -r '.status // "unknown"')"
             echo "status: ${STATUS}"
             [ "$STATUS" = "completed" ] && exit 0
             [ "$STATUS" = "aborted" ] && fail_or_warn "WP Engine aborted the backup."
@@ -314,10 +863,16 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to ${{ inputs.wpe_env }}
-    needs: [lint, backup]
-    # always() so a SKIPPED lint or backup job does not cancel the deploy; the
-    # explicit result checks are what keep a FAILED one blocking.
-    if: always() && !inputs.dry_run && needs.lint.result != 'failure' && needs.backup.result != 'failure'
+    needs: [preflight, lint, backup]
+    # Deploy ONLY when every upstream gate succeeded or was deliberately skipped.
+    # Not `always() && result != 'failure'`: `cancelled` is not `failure`, so
+    # that form ran the rsync after a cancellation during the production backup
+    # wait — a deploy with no restore point.
+    if: >-
+      ${{ !cancelled() && !inputs.dry_run
+          && needs.preflight.result == 'success'
+          && (needs.lint.result == 'success' || needs.lint.result == 'skipped')
+          && (needs.backup.result == 'success' || needs.backup.result == 'skipped') }}
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.environment }}
@@ -325,62 +880,266 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.preflight.outputs.sha }}
 
-      - name: Deploy theme to WP Engine
+      - name: Resolve the deployed commit
+        id: commit
+        env:
+          EXPECTED: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if [ "$SHA" != "$EXPECTED" ]; then
+            echo "::error title=Commit mismatch::Checked out ${SHA}, but preflight, lint and the backup were for ${EXPECTED}."
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          # The preflight step below is the same step as the preflight job's;
+          # this tells it to run strict, against the tree that will ship.
+          echo "PREFLIGHT_STAGE=post" >> "$GITHUB_ENV"
+
+      - name: Set up Node
+        if: inputs.setup_node != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.setup_node }}
+
+      - name: Set up PHP and Composer
+        if: inputs.setup_composer
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+          tools: composer
+
+      # Git-ignored build output (vendor/, build/) does not exist in a checkout,
+      # and --delete removes the server's copy of it. A plugin that needs it
+      # must build here, or must not use --delete.
+      - name: Build
+        if: inputs.build_command != ''
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+
+      # The same step as the preflight job (YAML alias), now against the built
+      # tree. It runs on every deploy, build or not: it is cheap, and it is the
+      # last look before anything is written.
+      - *preflight
+
+      # One step per target, because a `uses:` step cannot loop. Steps run in
+      # order, and a failed one skips every later one — so targets deploy in
+      # array order and stop at the first failure. Only the LAST target flushes
+      # the cache and runs post_deploy_script.
+      #
+      # THE DEFAULT `rsync_flags` DIFFERS FROM THE ACTION'S OWN DEFAULT
+      # (`-azvr --inplace --exclude=".*"`) IN THREE WAYS. All are deliberate.
+      #
+      # `--delete` is ADDED. Without it a file deleted from the repo lives on
+      # the install forever and the deploy still reports success. That is not
+      # hypothetical: WordPress discovers page templates by regex-scanning
+      # theme PHP files ON DISK, so a deleted template keeps appearing in the
+      # block editor's Template panel — and if it is a high-priority match
+      # like front-page.php it keeps SERVING. What bounds --delete is the
+      # PREFLIGHT above (one folder per target), NOT the action: the action's
+      # generated excludes apply only to exact REMOTE_PATH spellings.
+      #
+      # `--inplace` is REMOVED. It writes incoming bytes straight into the live
+      # destination file, skipping rsync's default of writing a temporary file
+      # and rename()-ing it over the target on completion. A same-directory
+      # rename() is atomic, so under the default a concurrent reader gets the
+      # whole old file or the whole new one. rsync's manual on --inplace: "The
+      # file's data will be in an inconsistent state during the transfer and
+      # will be left that way if the transfer is interrupted or if an update
+      # fails." A request landing inside that window compiles a truncated PHP
+      # file and fatals; opcache can keep serving the garbage until the next
+      # mtime change; and --inplace implies --partial, so a cancelled run
+      # LEAVES the broken bytes there.
+      #
+      # `--delay-updates --delete-delay` are ADDED. Per-file atomicity alone
+      # still let a new plugin main file go live before the new include it
+      # require_once's had arrived — every request in that window fatals
+      # (reproduced). With these, every updated file waits in a `.~tmp~`
+      # holding directory and all of them are renamed into place in one burst
+      # at the END of the transfer, and deletions happen after that.
+      #
+      # The honest limit: each file is atomic and all updates land together,
+      # but the burst itself is not one atomic act — a request can still land
+      # between two renames. Only a build directory plus a symlink swap makes a
+      # whole deploy atomic, and this action cannot do that.
+      #
+      # The action ALWAYS appends `--exclude-from=<generated list>` and
+      # `--chmod=D775,F664` after these flags (entrypoint.sh in
+      # wpengine/site-deploy), whatever rsync_flags says.
+      - name: Deploy target 1 of ${{ needs.preflight.outputs.count }}
         uses: wpengine/github-action-wpe-site-deploy@v3
         with:
           WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
           WPE_ENV: ${{ inputs.wpe_env }}
-          SRC_PATH: ${{ inputs.src_path }}
-          REMOTE_PATH: ${{ inputs.remote_path }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[0].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[0].remote_path }}
           PHP_LINT: TRUE
-          CACHE_CLEAR: ${{ inputs.cache_clear }}
-          # THE DEFAULT `rsync_flags` DIFFERS FROM THE ACTION'S OWN DEFAULT
-          # (`-azvr --inplace --exclude=".*"`) IN TWO WAYS. Both are deliberate.
-          #
-          # `--delete` is ADDED. Without it a file deleted from the repo lives on
-          # the install forever and the deploy still reports success. That is not
-          # hypothetical: WordPress discovers page templates by regex-scanning
-          # theme PHP files ON DISK, so a deleted template keeps appearing in the
-          # block editor's Template panel — and if it is a high-priority match
-          # like front-page.php it keeps SERVING, plausibly, from content the repo
-          # meant to leave dormant. Blast radius is bounded by REMOTE_PATH, and
-          # rsync never deletes a path matching an --exclude, so dotfiles survive.
-          #
-          # `--inplace` is REMOVED, and this is the one that had been copied
-          # around the fleet unexamined. It writes incoming bytes straight into
-          # the live destination file, skipping rsync's default of writing a
-          # temporary file in the destination directory and rename()-ing it over
-          # the target on completion. A same-directory rename() is atomic, so
-          # under the default a concurrent reader gets the whole old file or the
-          # whole new one. rsync's manual on --inplace: "The file's data will be
-          # in an inconsistent state during the transfer and will be left that way
-          # if the transfer is interrupted or if an update fails."
-          #
-          # A live WordPress theme is the textbook in-use file — functions.php and
-          # every template are read off disk on each request — so a request landing
-          # inside that window compiles a truncated or spliced file and fatals.
-          # With display_errors off on WP Engine that is a blank page whose only
-          # explanation is the install's error log. Opcache does not save you:
-          # revalidating inside the window can compile the garbage and serve it
-          # until the next mtime change. And --inplace implies --partial, so an
-          # interrupted or cancelled run LEAVES the broken bytes there.
-          #
-          # The honest limit: this makes each FILE atomic, not the DEPLOY. Halfway
-          # through, one template can be new while another is still old. It moves
-          # the failure mode from "a file is invalid" to "two valid files are
-          # briefly from different commits". Real deploy atomicity needs a build
-          # directory and a symlink swap, which this action cannot do.
-          FLAGS: ${{ inputs.rsync_flags }}
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '1' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '1' && inputs.post_deploy_script || '' }}
+
+      - name: Deploy target 2 of ${{ needs.preflight.outputs.count }}
+        if: fromJSON(needs.preflight.outputs.count) >= 2
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[1].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[1].remote_path }}
+          PHP_LINT: TRUE
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '2' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '2' && inputs.post_deploy_script || '' }}
+
+      - name: Deploy target 3 of ${{ needs.preflight.outputs.count }}
+        if: fromJSON(needs.preflight.outputs.count) >= 3
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[2].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[2].remote_path }}
+          PHP_LINT: TRUE
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '3' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '3' && inputs.post_deploy_script || '' }}
+
+      - name: Deploy target 4 of ${{ needs.preflight.outputs.count }}
+        if: fromJSON(needs.preflight.outputs.count) >= 4
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[3].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[3].remote_path }}
+          PHP_LINT: TRUE
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '4' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '4' && inputs.post_deploy_script || '' }}
+
+      - name: Deploy target 5 of ${{ needs.preflight.outputs.count }}
+        if: fromJSON(needs.preflight.outputs.count) >= 5
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[4].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[4].remote_path }}
+          PHP_LINT: TRUE
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '5' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '5' && inputs.post_deploy_script || '' }}
+
+      - name: Deploy target 6 of ${{ needs.preflight.outputs.count }}
+        if: fromJSON(needs.preflight.outputs.count) >= 6
+        uses: wpengine/github-action-wpe-site-deploy@v3
+        with:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          WPE_ENV: ${{ inputs.wpe_env }}
+          SRC_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[5].src_path }}
+          REMOTE_PATH: ${{ fromJSON(needs.preflight.outputs.targets)[5].remote_path }}
+          PHP_LINT: TRUE
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          CACHE_CLEAR: ${{ inputs.cache_clear && needs.preflight.outputs.count == '6' }}
+          SCRIPT: ${{ needs.preflight.outputs.count == '6' && inputs.post_deploy_script || '' }}
+
+      # `php -l` cannot see a runtime fatal: a missing class, a bad
+      # require_once, a function that does not exist on the install's PHP.
+      # `wp eval` loads WordPress with every active plugin, mu-plugin and the
+      # theme, so any of those fails it.
+      #
+      # The script goes over stdin to `bash -s` because the WP Engine SSH
+      # gateway strips quoting from a command line — `wp eval 'echo "ok";'` sent
+      # as an argument would arrive mangled. Note the gateway runs the install's
+      # CLI PHP, which is its CONFIGURED version; smoke_urls exercises the web
+      # tier's PHP.
+      - name: Post-deploy checks (wp-cli)
+        if: inputs.smoke_wp_cli || inputs.require_active_plugin != ''
+        env:
+          WPE_SSHG_KEY_PRIVATE: ${{ secrets.WPE_SSHG_KEY_PRIVATE }}
+          INSTALL: ${{ inputs.wpe_env }}
+          SMOKE: ${{ inputs.smoke_wp_cli }}
+          PLUGIN: ${{ inputs.require_active_plugin }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="${RUNNER_TEMP}/wpe_sshg_key"
+          printf '%s\n' "$WPE_SSHG_KEY_PRIVATE" > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+
+          REMOTE="${RUNNER_TEMP}/post-deploy-checks.sh"
+          {
+            printf 'INSTALL=%q\nSMOKE=%q\nPLUGIN=%q\n' "$INSTALL" "$SMOKE" "$PLUGIN"
+            cat <<'SCRIPT'
+          set -uo pipefail
+          cd "sites/${INSTALL}" || { echo "No sites/${INSTALL} on the gateway."; exit 1; }
+          if [ "$SMOKE" = true ]; then
+            if out="$(wp eval 'echo "ok";' 2>&1)" && [[ "$out" == *ok ]]; then
+              echo "wp eval: WordPress loaded cleanly."
+            else
+              printf '%s\n' "$out" | tail -n 40
+              echo "FAILED: wp eval — WordPress did not load cleanly with the deployed code."
+              exit 1
+            fi
+          fi
+          if [ -n "$PLUGIN" ]; then
+            if wp plugin is-active "$PLUGIN"; then
+              echo "wp plugin is-active ${PLUGIN}: yes."
+            else
+              echo "FAILED: plugin '${PLUGIN}' is not active. A renamed main file or folder deactivates a plugin silently."
+              exit 1
+            fi
+          fi
+          SCRIPT
+          } > "$REMOTE"
+
+          if ! ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=30 \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${RUNNER_TEMP}/wpe_known_hosts" \
+              "${INSTALL}@${INSTALL}.ssh.wpengine.net" 'bash -s' < "$REMOTE"; then
+            echo "::error title=Post-deploy check failed::See the log above. The code IS deployed; fix forward or re-deploy the previous release."
+            exit 1
+          fi
+
+      - name: Smoke-test URLs
+        if: inputs.smoke_urls != ''
+        env:
+          INSTALL: ${{ inputs.wpe_env }}
+          SMOKE_URLS: ${{ inputs.smoke_urls }}
+        run: |
+          set -euo pipefail
+          BASE="https://${INSTALL}.wpenginepowered.com"
+          FAILED=0
+          # -d '': every word on every line, not just the first line.
+          read -r -d '' -a URLS <<< "$SMOKE_URLS" || true
+          for p in "${URLS[@]}"; do
+            # -L: a production install redirects its wpenginepowered.com name to
+            # the primary domain, and that redirect is not a failure. --retry
+            # covers a 5xx in the seconds after the cache flush.
+            if ! RES="$(curl -sS -L --max-redirs 5 --max-time 60 --retry 2 --retry-delay 5 \
+                -o /dev/null -w '%{http_code} %{url_effective}' "${BASE}${p}")"; then
+              echo "::error title=Smoke test failed::${BASE}${p} could not be fetched."
+              FAILED=1; continue
+            fi
+            CODE="${RES%% *}"
+            case "$CODE" in
+              2??) echo "HTTP ${CODE}  ${BASE}${p}  (final: ${RES#* })" ;;
+              *)   echo "::error title=Smoke test failed::${BASE}${p} answered HTTP ${CODE} (final URL ${RES#* })."
+                   FAILED=1 ;;
+            esac
+          done
+          exit "$FAILED"
 
       - name: Summary
         env:
           ENV_NAME: ${{ inputs.environment }}
           TARGET: ${{ inputs.wpe_env }}
           LABEL: ${{ inputs.version }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          TARGETS: ${{ needs.preflight.outputs.targets }}
           BACKUP: ${{ needs.backup.outputs.status }}
-          BACKUP_RESULT: ${{ needs.backup.result }}
           WANTED_BACKUP: ${{ inputs.backup }}
         run: |
           set -euo pipefail
@@ -388,8 +1147,8 @@ jobs:
             echo "### Deployed to ${ENV_NAME}"
             echo ""
             echo "- Install: \`${TARGET}\`"
-            echo "- Commit: \`${GITHUB_SHA}\`"
-            [ -n "${LABEL}" ] && echo "- Label: \`${LABEL}\`"
+            echo "- Commit: \`${SHA}\`"
+            if [ -n "${LABEL}" ]; then echo "- Label: \`${LABEL}\`"; fi
             # Say it on EVERY run, not only the bad ones. A warning inside a
             # collapsed job log is a warning nobody reads, and "was there a
             # restore point?" should be answerable at a glance.
@@ -401,18 +1160,24 @@ jobs:
               echo "- Restore point: **NONE** — see the backup job. WP Engine's own automatic daily backup is the only fallback. Set \`backup_required: true\` to make this block the deploy instead."
             fi
             echo ""
-            echo "The theme is on the install. Content migrations and \`wp rewrite flush\` are SEPARATE manual steps — this action does neither."
+            jq -r '.[] | "- `\(.src_path)` → `\(.remote_path)`"' <<< "$TARGETS"
+            echo ""
+            echo "The code is on the install. Plugin activation, content migrations and \`wp rewrite flush\` are SEPARATE manual steps — this workflow does none of them."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # 4. DRY RUN — the rehearsal path. Proves the install name resolves and the
-  #    lint passes without writing anything, which is the only way to find out
-  #    that a credential pair cannot see an install BEFORE a real deploy needs it.
+  # 4. DRY RUN — the rehearsal path. Proves the deploy shape passes preflight,
+  #    the install name resolves and the lint passes without writing anything,
+  #    which is the only way to find out that a credential pair cannot see an
+  #    install BEFORE a real deploy needs it.
   # ---------------------------------------------------------------------------
   dry-run-report:
     name: Dry run
-    needs: [lint]
-    if: always() && inputs.dry_run && needs.lint.result != 'failure'
+    needs: [preflight, lint]
+    if: >-
+      ${{ !cancelled() && inputs.dry_run
+          && needs.preflight.result == 'success'
+          && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: What a real run would do
@@ -420,9 +1185,9 @@ jobs:
           WPE_API_USER_ID: ${{ secrets.WPE_API_USER_ID }}
           WPE_API_PASSWORD: ${{ secrets.WPE_API_PASSWORD }}
           INSTALL_NAME: ${{ inputs.wpe_env }}
-          SRC: ${{ inputs.src_path }}
-          DEST: ${{ inputs.remote_path }}
-          FLAGS: ${{ inputs.rsync_flags }}
+          TARGETS: ${{ needs.preflight.outputs.targets }}
+          FLAGS: ${{ needs.preflight.outputs.flags }}
+          SHA: ${{ needs.preflight.outputs.sha }}
           WANTS_BACKUP: ${{ inputs.backup }}
         run: |
           set -euo pipefail
@@ -432,16 +1197,25 @@ jobs:
             CFG="${RUNNER_TEMP}/wpe.curlrc"; umask 077
             printf 'user = "%s:%s"\n' "$WPE_API_USER_ID" "$WPE_API_PASSWORD" > "$CFG"
             trap 'rm -f "$CFG"' EXIT
-            ID=""; OFFSET=0
+            ID=""; OFFSET=0; FAILED=false
             while [ "$OFFSET" -le 1000 ]; do
-              PAGE="$(curl -sS --config "$CFG" "https://api.wpengineapi.com/v1/installs?limit=100&offset=${OFFSET}")"
+              # Same failure handling as the backup job: an HTTP error or a body
+              # that is not a JSON object is a FAILED lookup, not "not found".
+              if ! PAGE="$(curl -sS --fail-with-body --retry 2 --retry-delay 5 --config "$CFG" \
+                    "https://api.wpengineapi.com/v1/installs?limit=100&offset=${OFFSET}")" \
+                 || ! printf '%s' "$PAGE" | jq -e 'type == "object"' > /dev/null 2>&1; then
+                printf '%s\n' "${PAGE:-}" | head -c 500; echo
+                FAILED=true; break
+              fi
               ID="$(printf '%s' "$PAGE" | jq -r --arg n "$INSTALL_NAME" '(.results // [])[] | select(.name == $n) | .id' | head -n1)"
               [ -n "$ID" ] && break
               COUNT="$(printf '%s' "$PAGE" | jq -r '(.results // []) | length')"
               [ "$COUNT" -lt 100 ] && break
               OFFSET=$((OFFSET + 100))
             done
-            if [ -n "$ID" ]; then
+            if [ "$FAILED" = true ]; then
+              RESOLVED="**LOOKUP FAILED** — the WP Engine API returned an error or a non-JSON body (see the log). Whether \`${INSTALL_NAME}\` is visible is unknown."
+            elif [ -n "$ID" ]; then
               RESOLVED="resolved to \`${ID}\`"
             else
               RESOLVED="**NOT FOUND** — these credentials cannot see an install named \`${INSTALL_NAME}\`"
@@ -454,30 +1228,42 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Install | \`${INSTALL_NAME}\` |"
+            echo "| Commit | \`${SHA}\` |"
             echo "| API lookup | ${RESOLVED} |"
-            echo "| rsync | \`${SRC}\` → \`${DEST}\` |"
             echo "| Flags | \`${FLAGS}\` |"
             echo "| Backup a real run would take | \`${WANTS_BACKUP}\` |"
+            echo ""
+            echo "Deploy order, each passed preflight:"
+            echo ""
+            jq -r 'to_entries[] | "\(.key + 1). `\(.value.src_path)` → `\(.value.remote_path)`"' <<< "$TARGETS"
             echo ""
             echo "Re-run with \`dry_run: false\` to deploy."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # 5. FAILURE NOTICE — carried over from v1's prod workflow, which is the only
-  #    place it existed. Silently dropping it in the rewrite would have removed a
-  #    working capability from every repo that relies on it.
+  #    place it existed. It also fires when a PRODUCTION run is cancelled: a
+  #    cancellation mid-deploy is exactly when someone needs to look.
   # ---------------------------------------------------------------------------
   notify-failure:
     name: Notify on failure
-    needs: [lint, backup, deploy]
-    if: always() && (needs.lint.result == 'failure' || needs.backup.result == 'failure' || needs.deploy.result == 'failure')
+    needs: [preflight, lint, backup, deploy]
+    if: >-
+      ${{ always()
+          && (contains(needs.*.result, 'failure')
+              || (inputs.environment == 'production' && !inputs.dry_run
+                  && contains(needs.*.result, 'cancelled'))) }}
     runs-on: ubuntu-latest
+    # always() jobs are not cancellable, so nothing here may hang.
+    timeout-minutes: 5
     steps:
       - name: Post to Slack, if a webhook is configured
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           ENV_NAME: ${{ inputs.environment }}
           TARGET: ${{ inputs.wpe_env }}
+          ANY_FAILED: ${{ contains(needs.*.result, 'failure') }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -485,10 +1271,17 @@ jobs:
             echo "No SLACK_WEBHOOK_URL secret; nothing to notify."
             exit 0
           fi
+          if [ "$ANY_FAILED" = "true" ]; then
+            WHAT="failed"
+          elif [ "$DEPLOY_RESULT" = "cancelled" ]; then
+            WHAT="was CANCELLED during the rsync — check the install"
+          else
+            WHAT="was cancelled before anything was written"
+          fi
           # jq, not a quoted -d string: the repo and environment names end up
           # inside JSON and v1 built this by interpolation.
-          jq -n --arg t ":rotating_light: *${GITHUB_REPOSITORY}* — deploy to ${ENV_NAME} (${TARGET}) failed. <${RUN_URL}|View run>" \
+          jq -n --arg t ":rotating_light: *${GITHUB_REPOSITORY}* — deploy to ${ENV_NAME} (${TARGET}) ${WHAT}. <${RUN_URL}|View run>" \
             '{text: $t}' > "${RUNNER_TEMP}/slack.json"
-          curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" \
+          curl -sS --fail-with-body --max-time 30 --retry 2 -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
             --data @"${RUNNER_TEMP}/slack.json"

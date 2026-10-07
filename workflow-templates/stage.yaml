@@ -4,7 +4,7 @@ name: Deploy to WP Engine Staging
 #
 # THIS IS THE ONE BEHAVIOUR CHANGE IN v2 THAT AFFECTS EVERY EXISTING SITE.
 # Under v1 this template triggered on `pull_request: [opened, synchronize,
-# reopened]`, so every push to any open PR overwrote the staging theme. Two open
+# reopened]`, so every push to any open PR overwrote the staging code. Two open
 # PRs meant staging showed whichever was pushed last, and nothing said so.
 #
 # v2 splits the two jobs that were being asked of one install:
@@ -17,7 +17,8 @@ name: Deploy to WP Engine Staging
 #   Actions -> Deploy to WP Engine Staging -> Run workflow -> pick the branch.
 # `workflow_dispatch` runs this file from whatever ref you choose, so a branch
 # goes to staging when you decide it should, and the run records who asked.
-#   gh workflow run stage.yml --ref my-branch
+#   gh workflow run stage.yaml --ref my-branch
+# Add `-f dry_run=true` to rehearse without writing anything.
 #
 # TO RESTORE v1 BEHAVIOUR on a repo that has no dev install and where you would
 # rather have the convenience, add the open-PR actions to `types` below:
@@ -28,18 +29,26 @@ name: Deploy to WP Engine Staging
 # trap the moment you are not.
 
 on:
+  # No `branches:` filter: GitHub's default-branch placeholder only survives
+  # when the workflow is created from the template in the Actions UI, and a
+  # hard-coded `main` is wrong for the org's `master` and `develop` repos. The
+  # plan job compares the PR's base with the repository's default branch.
   pull_request:
     types: [closed]
-    branches:
-      - $default-branch
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  # NOT cancel-in-progress. Cancelling mid-rsync leaves the install carrying a
-  # partially-applied deploy; queueing behind the running one costs a minute.
+  # NOT cancel-in-progress. A run cancelled mid-rsync can leave staging between
+  # two commits; queueing behind the running one costs a minute.
   group: deploy-staging
   cancel-in-progress: false
 
@@ -67,6 +76,8 @@ jobs:
           HAS_SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-deploy') }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -76,6 +87,14 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "Manual run against ${GITHUB_REF}."
             emit true "$GITHUB_SHA"
+            exit 0
+          fi
+
+          # Only PRs into the default branch reach staging. A PR into a feature
+          # branch is not "about to be released".
+          if [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::notice title=Deploy skipped::This PR targets '${BASE_REF}', not the default branch '${DEFAULT_BRANCH}'."
+            emit false
             exit 0
           fi
 
@@ -116,10 +135,31 @@ jobs:
     uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
       wpe_env: ${{ vars.WPE_STAGE_ENV }}
+      # WHAT TO DEPLOY — keep this block identical in prod.yaml and dev.yaml.
+      # A theme (the default):
       src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      lint_paths: themes/THEME_NAME
+      # A plugin in a subfolder:
+      #   src_path: plugins/PLUGIN_SLUG/
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: plugins/PLUGIN_SLUG
+      # A repo whose root IS the plugin:
+      #   src_path: ./
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: .
+      # Theme + plugin + mu-plugin in ONE deploy (one backup, deployed in this
+      # order) — replaces src_path/remote_path. The mu-plugin FOLDER goes before
+      # its loader file. See the README.
+      #   targets: >-
+      #     [{"src_path": "themes/THEME_NAME/", "remote_path": "wp-content/themes/THEME_NAME/"},
+      #      {"src_path": "plugins/PLUGIN_SLUG/", "remote_path": "wp-content/plugins/PLUGIN_SLUG/"},
+      #      {"src_path": "mu-plugins/PKG/", "remote_path": "wp-content/mu-plugins/PKG/"},
+      #      {"src_path": "mu-plugins/PKG-loader.php", "remote_path": "wp-content/mu-plugins/PKG-loader.php"}]
+      #   lint_paths: themes/THEME_NAME plugins/PLUGIN_SLUG mu-plugins
       ref: ${{ needs.plan.outputs.ref }}
       environment: staging
+      dry_run: ${{ inputs.dry_run || false }}
       backup: true
       # Warn, do not block. Staging takes every merge, and a credential problem
       # should not be able to wedge the trunk. Flip to true once a real run has
@@ -128,8 +168,7 @@ jobs:
       # Do not wait for the snapshot: WP Engine backups take many minutes and
       # staging deploys are frequent. The consequence is that the snapshot runs
       # concurrently with the rsync, so it is a restore point for the database and
-      # uploads rather than a byte-exact pre-deploy copy of the theme. Git holds
-      # the theme.
+      # uploads rather than a byte-exact pre-deploy copy of the code. Git holds
+      # the code.
       backup_wait: false
-      lint_paths: themes/THEME_NAME
     secrets: inherit
