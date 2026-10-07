@@ -46,12 +46,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  # NOT cancel-in-progress. A run cancelled mid-rsync can leave staging between
-  # two commits; queueing behind the running one costs a minute.
-  group: deploy-staging
-  cancel-in-progress: false
-
 jobs:
   # Decides whether this event should deploy, and what to deploy. Kept as its own
   # job because a reusable workflow cannot be called conditionally on a shell
@@ -132,6 +126,16 @@ jobs:
   deploy:
     needs: plan
     if: needs.plan.outputs.deploy == 'true'
+    # On this job, not the workflow, so only runs that WILL deploy queue here.
+    # GitHub keeps one pending run per group and a newer one cancels it; at
+    # workflow level a close-without-merge or a skip-deploy merge would cancel
+    # a merged PR's pending deploy and leave staging a merge behind. Between
+    # two real deploys, the newer one superseding the older is what we want.
+    # NOT cancel-in-progress: a run cancelled mid-rsync can leave staging
+    # between two commits.
+    concurrency:
+      group: deploy-staging${{ inputs.dry_run && '-dry-run' || '' }}
+      cancel-in-progress: false
     uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
       wpe_env: ${{ vars.WPE_STAGE_ENV }}

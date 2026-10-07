@@ -131,6 +131,12 @@ reaches the rsync.
 | `cache_clear` | no | `true` | Flush page and CDN cache, once, after the last target |
 | `dry_run` | no | `false` | Preflight, lint, resolve the install, write nothing |
 
+Only the deploy job declares the `environment`, so a **required reviewer** on it pauses
+the run *after* the restore point is taken. The snapshot is still a valid restore point
+for the code, which nothing has touched yet, but database and upload changes made while
+the approval waits are not in it. Approve promptly, or take a fresh backup by
+re-running.
+
 **Required secret:** `WPE_SSHG_KEY_PRIVATE`
 
 **Needed only when `backup: true`:** `WPE_API_USER_ID`, `WPE_API_PASSWORD` secrets and
@@ -154,8 +160,10 @@ that lookup is reported as an error, never as "not found" — and on staging
 
 #### Preflight: what it refuses
 
-The deploy action protects a site in exactly one way: a fixed exclude list it
-generates when `REMOTE_PATH` is spelled *exactly* `''`, `.`, `wp-content(/)` or
+The deploy action protects a site with one exclude list. Its static part —
+`wp-config.php`, `_wpeprivate`, `.wpengine-conf/`, VCS files — applies to every deploy.
+The part that guards `uploads/`, caches, drop-ins and 12 named WP Engine mu-plugins is
+generated only when `REMOTE_PATH` is spelled *exactly* `''`, `.`, `wp-content(/)` or
 `wp-content/mu-plugins(/)`. Nothing in it bounds `--delete`. Each of these exited
 rsync 0 — a green deploy — when reproduced against the action's own code:
 
@@ -175,28 +183,33 @@ when:
 2. `src_path` does not exist in the commit being deployed.
 3. `src_path` is a directory without a trailing `/` (rsync would nest it one level
    too deep), or a file whose `remote_path` is not a file of the same name.
-4. The flags contain `--delete` and `remote_path` is a shared root: the site root,
-   `wp-content/`, `wp-content/plugins/`, `wp-content/themes/`, `wp-content/mu-plugins/`
-   or `wp-content/uploads/`. The one way through, for a root deploy you really mean, is
-   `--filter='P /*'` in `rsync_flags`, placed before any include, `R` rule or rules
-   file (nothing at the top level is ever deleted; rsync applies the first rule that
-   matches, so an earlier include would override it), *plus*
-   `allow_unsafe_remote_path: true`.
+4. The flags contain `--delete` and `remote_path` is a shared root. For the site
+   root, `wp-content/` and `wp-content/uploads/` there is no way through: deploy a
+   folder, or drop `--delete`. For `wp-content/plugins/`, `themes/` or `mu-plugins/`,
+   a root deploy you really mean needs `--filter='P /*'` in `rsync_flags`, placed
+   before any include, `R` rule or rules file, *plus* `allow_unsafe_remote_path: true`.
+   `P /*` keeps every top-level entry from being deleted. It protects one level only,
+   which is why it cannot make the site root or `wp-content/` safe: everything one
+   level down — each plugin, theme and upload — would still go. rsync applies the
+   first rule that matches, so an earlier include would override it.
 5. A directory deploy targets anything but **one** folder,
    `wp-content/{plugins,themes,mu-plugins}/<slug>/`, or a file deploy lands outside
    those three directories — unless `allow_unsafe_remote_path: true`, which warns on
    every run.
-6. A `wp-content/plugins/<slug>/` folder has no `*.php` directly in it with a
-   non-empty `Plugin Name:` header, or a `wp-content/themes/<slug>/` folder has no
-   `style.css` with `Theme Name:`. That is almost always the wrong `src_path`.
+6. `src_path` looks one level too high — it contains a folder named like the
+   destination slug, as `mu-plugins/` → `wp-content/mu-plugins/lyh-core/` would — or a
+   `wp-content/plugins/<slug>/` folder has no `*.php` directly in it with a non-empty
+   `Plugin Name:` header, or a `wp-content/themes/<slug>/` folder has no `style.css`
+   with `Theme Name:`. That is almost always the wrong `src_path`.
 7. A single `.php` file is deployed and `lint_paths` does not cover it. The action's own
    `PHP_LINT` runs `find "$SRC_PATH"/`, which finds nothing for a file and still prints
    success — so the lint job is the only lint that file gets.
 
 It also rejects `--delete-excluded` (it would delete the very files the action's
 excludes protect), `--inplace` together with `--delay-updates` (rsync refuses the pair),
-two targets with the same destination, nested targets under `--delete`, a non-option
-word in `rsync_flags`, an empty `wpe_env` (an unset `WPE_*_ENV` variable), and malformed
+`--relative` / `-R` and `--files-from` (they move or replace the source), two targets
+with the same destination, nested targets under `--delete`, a non-option word in
+`rsync_flags`, an empty `wpe_env` (an unset `WPE_*_ENV` variable), and malformed
 `targets`, `php_versions`, `post_deploy_script`, `require_active_plugin` or `smoke_urls`
 values. It warns when an mu-plugin loader is listed before its folder.
 
@@ -500,7 +513,7 @@ and `develop` repos all work as copied.
 | `release-please.yaml` **and** `prod.yaml` | always, together — release-please calls `prod.yaml` when it cuts a release. **Not live yet?** Uncomment the `if: vars.PROD_DEPLOY_ENABLED == 'true'` line on `prod.yaml`'s plan job, and set that variable to `true` on launch day |
 | `dev.yaml` | only if the site has a dev install |
 
-`release-please.yaml` also needs two files that a workflow template cannot carry.
+`release-please.yaml` also needs three files that a workflow template cannot carry.
 Copy them from `client-repo-templates/` and edit the paths in the config:
 
 ```sh
@@ -557,6 +570,9 @@ one run per repo during the rollout. Both `stage.yaml` and `prod.yaml` expose it
 gh workflow run stage.yaml --ref main -f dry_run=true
 gh workflow run prod.yaml -f tag=v1.4.2 -f dry_run=true
 ```
+
+The production dry run gets through the NOT YET LIVE gate, which lets `dry_run`
+pass, so a site can rehearse against its production install before launch.
 
 ## Versioning a site repo
 
@@ -666,6 +682,11 @@ release-please to that folder, so only commits touching it count:
 ```
 
 with `.github/.release-please-manifest.json` set to `{ "plugins/lyh-welcome": "1.2.3" }`.
+The example shows only what changes. Keep everything else from the template config —
+`changelog-sections` especially: without it release-please falls back to its own
+defaults, which hide `docs` and `refactor` and drop `deps`, so those stop cutting
+releases. The template's `release-please.yaml` reads the package's prefixed outputs
+(`plugins/lyh-welcome--tag_name`) itself, so it needs no edit.
 
 - Only commits that touch a file under `plugins/lyh-welcome/` count toward its version
   and changelog. A `feat:` that touches only the theme, or a sibling folder such as

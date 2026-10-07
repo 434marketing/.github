@@ -17,10 +17,11 @@ name: Release Please
 # file fails this whole workflow at startup, Release PR included. Not live yet?
 # Add prod.yaml anyway and uncomment its NOT YET LIVE gate.
 #
-# BEFORE THIS WORKS, two files have to exist in the repo. Copy them from
+# BEFORE THIS WORKS, three files have to exist in the repo. Copy them from
 # `client-repo-templates/` in 434marketing/.github and edit the paths:
 #     .github/release-please-config.json
 #     .github/.release-please-manifest.json
+#     .github/VERSION
 #
 # AND ONE REPO SETTING: Settings -> Actions -> General -> "Allow GitHub Actions
 # to create and approve pull requests" must be ON, or GITHUB_TOKEN cannot open
@@ -85,8 +86,8 @@ jobs:
       issues: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_created: ${{ steps.released.outputs.created }}
+      tag_name: ${{ steps.released.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
 
@@ -103,8 +104,11 @@ jobs:
             exit 1
           fi
           CURRENT="$(jq -r '.[] | ltrimstr("v")' "$MANIFEST" | sort -V | tail -n1)"
-          NEWEST="$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/v##' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          # Its own command, so a failed lookup fails the step instead of
+          # looking like a repo with no tags.
+          git ls-remote --tags --refs origin 'v*' > "${RUNNER_TEMP}/tags.txt"
+          NEWEST="$(sed 's#.*refs/tags/v##' "${RUNNER_TEMP}/tags.txt" \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n1)"
           if [ -n "$NEWEST" ] && [ "$(printf '%s\n%s\n' "$CURRENT" "$NEWEST" | sort -V | tail -n1)" != "$CURRENT" ]; then
             echo "::error title=Manifest is behind the tags::The manifest says ${CURRENT}, but this repo already has v${NEWEST}. Set ${MANIFEST} (and .github/VERSION) to ${NEWEST}, so the next release is the one after it. See 'Repos that already have release tags' in the 434marketing/.github README."
             exit 1
@@ -130,6 +134,27 @@ jobs:
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
 
+      # release-please-action prefixes its per-release outputs with the package
+      # path for anything but the root package: `plugins/<slug>--tag_name`, not
+      # `tag_name`. Read them path-independently, so a repo scoped to one plugin
+      # folder (see the README) deploys too.
+      - name: Resolve the released tag
+        id: released
+        env:
+          OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+        run: |
+          set -euo pipefail
+          if [ "$(jq -r '.releases_created // "false"' <<< "$OUTPUTS")" != "true" ]; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t TAGS < <(jq -r 'to_entries[] | select(.key | test("(^|--)tag_name$")) | .value | select(. != "")' <<< "$OUTPUTS" | sort -u)
+          if [ "${#TAGS[@]}" -ne 1 ]; then
+            echo "::error title=Cannot pick one release::release-please cut ${#TAGS[@]} tags (${TAGS[*]:-none}). Production deploys one vX.Y.Z tag per run; deploy with prod.yaml's Run workflow."
+            exit 1
+          fi
+          { echo "created=true"; echo "tag=${TAGS[0]}"; } >> "$GITHUB_OUTPUT"
+
       - name: Explain a permissions failure
         if: failure()
         run: |
@@ -138,8 +163,8 @@ jobs:
       - name: Summary
         if: success()
         env:
-          RELEASED: ${{ steps.release.outputs.release_created }}
-          TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASED: ${{ steps.released.outputs.created }}
+          TAG: ${{ steps.released.outputs.tag }}
           PRS: ${{ steps.release.outputs.prs_created }}
         run: |
           set -euo pipefail
@@ -147,7 +172,7 @@ jobs:
             echo "### Release Please"
             echo ""
             if [ "${RELEASED}" = "true" ]; then
-              echo "Cut release **${TAG}**. The \`production\` job in this run deploys it next."
+              echo "Cut release **${TAG}**. The \`production\` job in this run runs next — it deploys the release unless prod.yaml's NOT YET LIVE gate is on."
             elif [ "${PRS}" = "true" ]; then
               echo "Release PR opened or updated. Merge it when you want to release."
             else

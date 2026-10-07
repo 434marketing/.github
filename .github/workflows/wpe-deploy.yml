@@ -223,9 +223,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # 0. PREFLIGHT — fail closed on a deploy shape that would wipe or misplace code.
   #
-  #    The deploy action's own protection is a fixed exclude list that applies
-  #    only when REMOTE_PATH is spelled EXACTLY '', '.', 'wp-content(/)' or
-  #    'wp-content/mu-plugins(/)', and nothing bounds --delete. Each of these
+  #    The deploy action's own protection is an exclude list. Its static part
+  #    (wp-config.php, _wpeprivate, VCS files) applies to every deploy; the part
+  #    that guards uploads/, caches and WP Engine's own mu-plugins applies only
+  #    when REMOTE_PATH is spelled EXACTLY '', '.', 'wp-content(/)' or
+  #    'wp-content/mu-plugins(/)'. Nothing in it bounds --delete. Each of these
   #    was reproduced exiting rsync 0 — a green deploy:
   #      plugins/<slug>/ -> wp-content/plugins/   deletes every other plugin
   #      plugins/        -> wp-content/plugins/   deletes plugins not in git and
@@ -336,6 +338,8 @@ jobs:
               *)   err "rsync_flags contains '${a}', which is not an option, so rsync would treat it as an extra source and deploy it too. Write options as --name=value." ;;
             esac
             case "$a" in
+              --relative|-[!-]*R*|--files-from=*)
+                err "rsync_flags contains '${a}'. --relative (-R) recreates src_path under remote_path, so the code lands nested while the old code keeps running; --files-from replaces src_path altogether. Neither is supported." ;;
               --delete-excluded)
                 err "--delete-excluded deletes server files that MATCH an exclude — which includes the deploy action's own protections (uploads/, wp-config.php, WP Engine's mu-plugins). It is not supported." ;;
               --del|--delete|--delete-*) HAS_DELETE=true ;;
@@ -466,11 +470,19 @@ jobs:
             # Rule 4 — never --delete a shared root. A root holds things this repo does
             # not own: other plugins, third-party themes, WP Engine's own mu-plugins
             # (the action's exclude list names only 12 of them).
+            # --filter='P /*' protects only the TOP level of the destination, so
+            # it can make a root of single packages safe (plugins/, themes/,
+            # mu-plugins/) but never the site root, wp-content/ or uploads/:
+            # there the next level down — every plugin, theme, upload — would
+            # still be deleted.
             if [ "$HAS_DELETE" = true ] && [ "$kind" = dir ]; then
-              case "${dest%/}" in ''|.|wp-content|wp-content/plugins|wp-content/themes|wp-content/mu-plugins|wp-content/uploads)
-                if [ "$HAS_PROTECT" != true ]; then
-                  err "${where}: --delete into '${dest}' removes everything there that this repo does not contain — every other plugin, theme or mu-plugin. Deploy one folder (wp-content/<plugins|themes|mu-plugins>/<slug>/). For a root deploy you really mean, add --filter='P /*' to rsync_flags BEFORE any include rule, so nothing at the top level is ever deleted, and set allow_unsafe_remote_path."
-                fi ;;
+              case "${dest%/}" in
+                ''|.|wp-content|wp-content/uploads)
+                  err "${where}: --delete into '${dest}' removes everything below it that this repo does not contain — other plugins, themes, uploads. No flag makes that safe; deploy one folder (wp-content/<plugins|themes|mu-plugins>/<slug>/), or drop --delete." ;;
+                wp-content/plugins|wp-content/themes|wp-content/mu-plugins)
+                  if [ "$HAS_PROTECT" != true ]; then
+                    err "${where}: --delete into '${dest}' removes everything there that this repo does not contain — every other plugin, theme or mu-plugin. Deploy one folder (wp-content/<plugins|themes|mu-plugins>/<slug>/). For a root deploy you really mean, add --filter='P /*' to rsync_flags BEFORE any include rule, so nothing at the top level is ever deleted, and set allow_unsafe_remote_path."
+                  fi ;;
               esac
             fi
 
@@ -495,9 +507,22 @@ jobs:
             if [ "$kind" = dir ]; then DIR_SRCS+=("$src"); DIR_DESTS+=("$dest"); fi
             [ "$pending" = false ] || return 0
 
-            # Rule 6 — the folder is what remote_path says it is. A plugin folder with
-            # no header file is not a plugin to WordPress, and a theme folder with no
-            # style.css is not a theme.
+            # Rule 6 — the folder is what remote_path says it is. First the generic
+            # sign of a src_path one level too high: the source CONTAINS a folder
+            # named like the destination slug (mu-plugins/ → mu-plugins/<pkg>/,
+            # which an mu-plugin folder has no header to catch).
+            if [ "$kind" = dir ] && [[ "$dest" =~ ^wp-content/(plugins|themes|mu-plugins)/([^/]+)/$ ]] \
+                && [ -d "${src}${BASH_REMATCH[2]}" ]; then
+              if [ "$ALLOW_UNSAFE" = true ]; then
+                warn "${where}: '${src}' contains a '${BASH_REMATCH[2]}/' folder, so src_path looks one level too high. Allowed only because allow_unsafe_remote_path is true."
+              else
+                err "${where}: '${src}' contains a '${BASH_REMATCH[2]}/' folder, so src_path looks one level too high — the code would land in ${dest}${BASH_REMATCH[2]}/ and --delete would remove what is live at ${dest}. Did you mean '${src}${BASH_REMATCH[2]}/'?"
+              fi
+            fi
+
+            # Then the headers: a plugin folder with no header file is not a
+            # plugin to WordPress, and a theme folder with no style.css is not a
+            # theme.
             if [ "$kind" = dir ]; then
               local missing=""
               if [[ "$dest" =~ ^wp-content/plugins/[^/]+/$ ]]; then
@@ -940,7 +965,8 @@ jobs:
       # block editor's Template panel — and if it is a high-priority match
       # like front-page.php it keeps SERVING. What bounds --delete is the
       # PREFLIGHT above (one folder per target), NOT the action: the action's
-      # generated excludes apply only to exact REMOTE_PATH spellings.
+      # generated excludes for uploads/, caches and WP Engine's mu-plugins
+      # apply only to exact REMOTE_PATH spellings.
       #
       # `--inplace` is REMOVED. It writes incoming bytes straight into the live
       # destination file, skipping rsync's default of writing a temporary file
@@ -1189,6 +1215,7 @@ jobs:
           FLAGS: ${{ needs.preflight.outputs.flags }}
           SHA: ${{ needs.preflight.outputs.sha }}
           WANTS_BACKUP: ${{ inputs.backup }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
         run: |
           set -euo pipefail
 
@@ -1233,7 +1260,11 @@ jobs:
             echo "| Flags | \`${FLAGS}\` |"
             echo "| Backup a real run would take | \`${WANTS_BACKUP}\` |"
             echo ""
-            echo "Deploy order, each passed preflight:"
+            if [ -n "$BUILD_COMMAND" ]; then
+              echo "Deploy order. These passed the pre-build checks only: a dry run does not run build_command, so whatever preflight deferred to after the build (see its notices) is unchecked:"
+            else
+              echo "Deploy order, each passed preflight:"
+            fi
             echo ""
             jq -r 'to_entries[] | "\(.key + 1). `\(.value.src_path)` → `\(.value.remote_path)`"' <<< "$TARGETS"
             echo ""

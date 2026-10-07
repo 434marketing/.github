@@ -33,7 +33,9 @@ name: Deploy to WP Engine Production
 # NOT YET LIVE? Uncomment the `if:` on the plan job below and leave the
 # repository variable PROD_DEPLOY_ENABLED unset until launch. The plan job runs
 # on all three entry points, so a release cut before launch cannot reach the
-# public site even by accident. Set the variable to `true` on launch day.
+# public site even by accident. A dry run still gets through: it writes nothing,
+# and rehearsing before launch is the point. Set the variable to `true` on
+# launch day.
 
 on:
   workflow_call:
@@ -67,14 +69,10 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
 jobs:
   plan:
     name: Plan
-    # if: vars.PROD_DEPLOY_ENABLED == 'true'   # NOT YET LIVE: uncomment until launch
+    # if: vars.PROD_DEPLOY_ENABLED == 'true' || inputs.dry_run   # NOT YET LIVE: uncomment until launch
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.v.outputs.tag }}
@@ -120,6 +118,13 @@ jobs:
 
   deploy:
     needs: plan
+    # On this job, not the workflow: a run that is not going to deploy must not
+    # hold a place in the queue. GitHub keeps ONE pending run per group and a
+    # newer one cancels it, so a workflow-level group let a dry run displace a
+    # real deploy waiting its turn. Dry runs get their own group.
+    concurrency:
+      group: deploy-production${{ inputs.dry_run && '-dry-run' || '' }}
+      cancel-in-progress: false
     uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
       wpe_env: ${{ vars.WPE_PROD_ENV }}
