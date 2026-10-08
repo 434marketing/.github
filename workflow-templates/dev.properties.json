@@ -1,6 +1,6 @@
 {
   "name": "WP Engine Dev Deploy",
-  "description": "Deploys a theme, plugin or mu-plugin to a WP Engine DEV install on every push to an open pull request. Add this only to a repo that has a dev install (typically an in-place rebuild). Requires the WPE_SSHG_KEY_PRIVATE secret and the WPE_DEV_ENV variable.",
+  "description": "Deploys a theme, plugin or mu-plugin to the WP Engine dev install on every push to an open pull request. Add it only to a site repo that has a dev install, normally for an in-place rebuild. Needs the WPE_SSHG_KEY_PRIVATE secret and the WPE_DEV_ENV variable.",
   "iconName": "octicon-beaker",
   "categories": ["Deployment"]
 }

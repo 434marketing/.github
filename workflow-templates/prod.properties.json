@@ -1,6 +1,6 @@
 {
   "name": "WP Engine Production Deploy",
-  "description": "Deploys a theme, plugin or mu-plugin to WP Engine production from a vX.Y.Z release tag — called by the Release Please workflow when its Release PR is merged, or run by hand for an existing tag. Waits for a completed pre-deploy restore point and refuses to deploy without one. Requires the WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID and WPE_API_PASSWORD secrets, the WPE_PROD_ENV variable and the BACKUP_NOTIFICATION_EMAIL variable. Add together with the Release Please template.",
+  "description": "Deploys a theme, plugin or mu-plugin to WP Engine production from a vX.Y.Z release tag. The Release Please workflow calls it when its Release PR merges, or you run it by hand for an existing tag. It waits until a backup (a restore point) is complete, and does not deploy without one. Needs the WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID and WPE_API_PASSWORD secrets and the WPE_PROD_ENV and BACKUP_NOTIFICATION_EMAIL variables. Add it together with the Release Please template.",
   "iconName": "octicon-rocket",
   "categories": ["Deployment"]
 }

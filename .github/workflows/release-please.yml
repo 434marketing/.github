@@ -1,37 +1,37 @@
 name: Release Please
 
-# Auto-versioning for the shared workflows. Runs on every push to `main` and
-# keeps ONE open "Release PR" that accumulates pending changes and shows the
-# version they will cut. Merging that PR is the act of releasing: it writes
-# CHANGELOG.md, bumps .github/VERSION and the manifest, and creates the tag and
-# GitHub Release.
+# Versioning for the shared workflows. It runs on every push to `main`, and
+# keeps 1 open Release PR that collects the pending changes and shows the
+# version they will cut. A merge of the Release PR is the release. It writes
+# CHANGELOG.md, updates .github/VERSION and the manifest, and creates the tag
+# and the GitHub Release.
 #
-# Creating the tag is NOT the same as delivering the release. Sites reference
-# @v1, so the floating major tag has to move too -- that is the second job.
+# The tag alone does not deliver the release. Site repos reference a major tag
+# such as `@v2`, so that floating tag must move too. The second job does that.
 #
-# WHY THE SECOND JOB EXISTS, instead of letting update-major-tag.yml's `push:
-# tags:` trigger catch it: a tag created with GITHUB_TOKEN does not trigger
-# other workflows. If we relied on the trigger, release-please would cut v1.2.0,
-# `v1` would stay on v1.1.0, and the release would reach nobody -- exactly the
-# failure mode update-major-tag.yml was written to prevent, reintroduced
-# silently. So this workflow calls that one directly.
+# Why a second job, and not the `push: tags` trigger in update-major-tag.yml: a
+# tag created with GITHUB_TOKEN starts no other workflow. With the trigger only,
+# release-please would cut v2.1.0, `v2` would stay on v2.0.0, and the release
+# would reach no site repo. update-major-tag.yml exists to prevent that
+# failure, so this workflow calls it directly.
 #
-# TOKEN CHOICE -- read this before changing it.
-# As verified on 2026-08-27 this repo has `can_approve_pull_request_reviews:
-# true` (Settings -> Actions -> General -> "Allow GitHub Actions to create and
-# approve pull requests"), so the built-in GITHUB_TOKEN can open the Release PR
-# and no PAT is needed. Keep it that way if you can: the org's "Vendor Gate"
-# ruleset requires one approving review on `main`, and a PR opened by
-# github-actions[bot] is a PR *you* are allowed to approve. Switch to a PAT and
-# the Release PR becomes your own PR, which you cannot approve yourself.
-# If that setting is ever turned off, add a fine-grained PAT with
-# Contents: read/write + Pull requests: read/write and use it here.
+# Token choice. Read this before you change it.
+# Verified on 2026-08-27: this repo has `can_approve_pull_request_reviews: true`
+# (Settings -> Actions -> General -> "Allow GitHub Actions to create and approve
+# pull requests"). The built-in GITHUB_TOKEN can therefore open the Release PR,
+# and no PAT is necessary. If you can, keep it that way. The "Vendor Gate"
+# ruleset of the org requires 1 approving review on `main`, and you can approve
+# a PR that github-actions[bot] opened. With a PAT, the Release PR is your own
+# PR, which you cannot approve.
+# If that setting is ever turned off, add a fine-grained PAT with Contents:
+# read/write and Pull requests: read/write, and use it here.
 
 on:
   push:
     branches: [main]
 
-# Repo default workflow permission is `read`, so these are required.
+# The default workflow permission in this repo is `read`. Each job that
+# writes sets its own permissions.
 permissions:
   contents: read
 
@@ -62,7 +62,7 @@ jobs:
       - name: Explain a permissions failure
         if: failure()
         run: |
-          echo "::error title=release-please failed::If the log says GitHub Actions is not permitted to create or approve pull requests, enable that setting in Settings -> Actions -> General, or supply a PAT. See the comment at the top of this workflow file."
+          echo "::error title=release-please failed::Look in the log for: GitHub Actions is not permitted to create or approve pull requests. If it is there, turn on that setting in Settings -> Actions -> General. As an alternative, use a PAT. See the comment at the top of this workflow file."
 
       - name: Summary
         if: success()
@@ -76,19 +76,19 @@ jobs:
             echo "### Release Please"
             echo ""
             if [ "${RELEASED}" = "true" ]; then
-              echo "Cut release **${TAG}**. The \`v<major>\` tag is being moved to it now."
+              echo "Cut release **${TAG}**. The next job in this run moves the \`v<major>\` tag to it."
               echo ""
-              echo "Every site referencing \`@v1\` picks this up on its next deploy."
+              echo "Every site repo on the same major tag gets this release on its next deploy."
             elif [ "${PRS}" = "true" ]; then
-              echo "Release PR opened or updated. Merge it when you want to cut the version."
+              echo "Release PR opened or updated. Merge it when you want to cut a release."
             else
               echo "No releasable changes on this push."
               echo ""
-              echo "Only \`feat\`, \`fix\`, and breaking changes (\`!\` or a \`BREAKING CHANGE:\` footer) cut a version. \`chore\`, \`ci\`, \`docs\`, \`build\`, \`test\` and \`style\` do not."
+              echo "\`feat\` cuts a minor, and a breaking change (\`!\` or a \`BREAKING CHANGE:\` footer) cuts a major. \`fix\`, \`docs\`, \`perf\`, \`deps\`, \`refactor\` and \`revert\` cut a patch. \`chore\`, \`ci\`, \`build\`, \`test\` and \`style\` cut nothing."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Delivery. Without this the tag exists and nothing reaches any site.
+  # Delivery. Without this job, the tag exists but nothing reaches a site repo.
   move-major-tag:
     name: Move v<major> to the new release
     needs: release-please

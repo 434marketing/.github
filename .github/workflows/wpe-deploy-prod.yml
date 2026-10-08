@@ -1,8 +1,8 @@
 name: WP Engine Production Deploy
 
-# DEPRECATED as of v2 — superseded by `wpe-deploy.yml`, which does every
-# environment from one file. This is kept so nothing pinned to `@v1` breaks.
-# See the README's migration section. Fixes still land here; features do not.
+# DEPRECATED as of v2. Use `wpe-deploy.yml`, which deploys every environment
+# from 1 file. This file stays so that nothing pinned to `@v1` breaks. It gets
+# fixes, not new features. To migrate, see the migration procedure in the README.
 
 on:
   workflow_call:

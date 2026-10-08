@@ -1,32 +1,33 @@
 version: 2
 updates:
-  # Keeps the actions used inside the reusable workflows current
-  # (actions/checkout, actions/setup-node, shivammathur/setup-php,
-  # softprops/action-gh-release, wpengine/github-action-wpe-site-deploy).
-  # A bump here reaches every site on @v2 (and @v1) once it is released, so review
-  # these PRs like any other change.
+  # Keeps the actions in the shared workflows current. They include
+  # actions/checkout, actions/setup-node, shivammathur/setup-php,
+  # softprops/action-gh-release and wpengine/github-action-wpe-site-deploy.
+  # After a release, a bump here reaches every site repo on the current major
+  # tag (`@v2`). It does not reach `@v1`. A site repo that still calls at
+  # `@main` gets it at merge. Review these PRs like any other change.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
-      # `deps`, not `chore`. release-please treats a type as releasable if that
-      # type is VISIBLE in `changelog-sections` -- a hidden type produces empty
-      # release notes and no release at all. `chore` is hidden here on purpose
-      # (a comment tidy-up should not move `v1` for every site), so a
-      # `chore(deps)` bump would sit on main undelivered and unlogged until some
-      # unrelated change happened to cut a release.
+      # `deps`, not `chore`. release-please releases a type only if the type is
+      # visible in `changelog-sections`. A hidden type gives empty release notes
+      # and no release. `chore` is hidden here on purpose: a comment tidy-up
+      # must not move the major tag for every site repo. A `chore(deps)` bump
+      # would then wait on `main`, not delivered and not logged, until an
+      # unrelated change cuts a release.
       #
-      # `deps` is visible, so a bump cuts a PATCH on its own, and release-please
-      # has a built-in "Dependencies" heading for it.
+      # `deps` is visible, so a bump cuts a patch on its own. release-please
+      # also has a built-in "Dependencies" heading for it.
       #
-      # A bump that changes THIS repo's interface for callers (a new required
-      # secret, a renamed input) is still a MAJOR, and needs a human to retitle
-      # the PR `deps!:` before merging. Dependabot cannot know that.
+      # A bump that changes the interface of this repo for callers (a new
+      # required secret, a renamed input) is still a major. Before the merge, a
+      # person must retitle that PR `deps!:`. Dependabot cannot know that.
       prefix: "deps"
-    # No `labels:` here on purpose. Versioning in this repo is driven by the
-    # commit message, not by labels -- see .github/workflows/release-please.yml.
+    # No `labels:` here, on purpose. The version of this repo comes from the
+    # commit message, not from labels. See .github/workflows/release-please.yml.
     #
-    # The major/minor/patch labels drove the DEPRECATED v1 wpe-deploy-prod.yml in
-    # site repos. v2 dropped them: a site's version comes from release-please
-    # there too. Leaving one on a PR here would only suggest it does something.
+    # The major/minor/patch labels drove the deprecated v1 wpe-deploy-prod.yml
+    # in site repos. v2 dropped them: release-please sets the version in site
+    # repos too. A label on a PR here would only suggest that it does something.
