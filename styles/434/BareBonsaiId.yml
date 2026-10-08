@@ -1,0 +1,9 @@
+extends: existence
+message: "W16: cite the Bonsai task as ID plus title, for example 'TSK-08881 Dodson: Remove Print-O-Matic plugin'."
+level: error
+nonword: true
+# Vale uses Go RE2, which has no lookahead. This catches an ID followed by
+# punctuation or the end of a line. An ID followed by prose ("TSK-08881 for")
+# is not caught. The agent checklist covers that case.
+raw:
+  - '(?m)\bTSK-\d{4,6}(?:[^\sA-Za-z0-9]|\s+[^A-Za-z\s]|\s*$)'

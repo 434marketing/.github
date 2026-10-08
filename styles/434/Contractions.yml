@@ -1,0 +1,29 @@
+extends: substitution
+message: "W12: write '%s' instead of '%s'. No contractions."
+level: error
+ignorecase: true
+swap:
+  "aren't": are not
+  "can't": cannot
+  "couldn't": could not
+  "didn't": did not
+  "doesn't": does not
+  "don't": do not
+  "hasn't": has not
+  "haven't": have not
+  "isn't": is not
+  "it's": it is
+  "shouldn't": should not
+  "that's": that is
+  "there's": there is
+  "they're": they are
+  "wasn't": was not
+  "we're": we are
+  "we'll": we will
+  "we've": we have
+  "weren't": were not
+  "won't": will not
+  "wouldn't": would not
+  "you're": you are
+  "you'll": you will
+  "you've": you have

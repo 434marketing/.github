@@ -1,8 +1,10 @@
 # Deploy a Site Repo to WP Engine with the Shared Workflows
 
-> **Use when:** you set up or migrate how a 434 site repo deploys, or change a shared workflow here.
-> **Time:** 10 min per site repo · **Who:** 434 developer or agent · **Risk:** high
-> **Related:** [PR #15](https://github.com/434marketing/.github/pull/15), [deploy SOP](https://github.com/434marketing/wp-admin/blob/main/sops/DEPLOYMENT_SOP.md)
+> **Use when:** you set up or migrate how a 434 site repo deploys, or change a shared workflow here.\
+> **Time:** 10 min per site repo\
+> **Who:** 434 developer or agent\
+> **Risk:** high\
+> **Related:** [PR #15](https://github.com/434marketing/.github/pull/15), [deploy SOP](https://github.com/434marketing/wp-admin/blob/main/sops/DEPLOYMENT_SOP.md)\
 > **Source of record:** [`434marketing/.github/README.md`](https://github.com/434marketing/.github/blob/main/README.md)
 
 ## Overview
