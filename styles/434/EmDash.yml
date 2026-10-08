@@ -1,0 +1,7 @@
+extends: existence
+message: "W13: do not use an em dash. Use a period, a comma, or a colon."
+level: error
+nonword: true
+tokens:
+  - '—'
+  - ' -- '

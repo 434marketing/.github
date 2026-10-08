@@ -1,19 +1,179 @@
 name: Deploy to WP Engine Production
 
+# Caller for the production environment. Production deploys a release tag, and
+# the tag comes from a merge of the Release PR.
+#
+# This is the second trigger change in v2. The first is in stage.yaml. In v1
+# this template ran on `pull_request: [closed]` against the default branch, so
+# a merge of any PR deployed straight to production. After the deploy, the
+# shared workflow set a version number from `major`/`minor`/`patch` labels. Code
+# went live in the same click that merged it, and a forgotten label silently
+# released a patch version.
+#
+# In v2 these are 3 separate acts:
+#
+#   1. Merge a PR              -> the code lands on the default branch and
+#                                 deploys to staging
+#   2. Merge the Release PR    -> release-please writes CHANGELOG.md, updates
+#                                 the version number and creates the vX.Y.Z tag
+#   3. release-please.yaml     -> calls this workflow with that tag, which
+#                                 deploys production
+#
+# Step 2 is the gate. The Release PR shows the exact version and changelog
+# before anything deploys. The label scheme could not do that.
+#
+# Why a call and not `on: push: tags`: release-please creates the tag with
+# GITHUB_TOKEN, and an event created with GITHUB_TOKEN starts no workflow run.
+# A tag trigger alone never fires for a release-please tag. So this file has 3
+# entry points and 1 implementation:
+#
+#   workflow_call      The normal path: release-please.yaml, after a release.
+#   push (tags)        A vX.Y.Z tag pushed by hand. That push does start
+#                      workflows.
+#   workflow_dispatch  Deploy an existing tag again. Also the way to start a
+#                      dry run.
+#
+# NOT YET LIVE: if the site is not live yet, uncomment the `if:` on the plan job
+# below. Do not set the repository variable PROD_DEPLOY_ENABLED. The plan job
+# runs on all 3 entry points, so a release cut before launch cannot reach
+# the public site by accident. A dry run still passes the gate: it writes
+# nothing, and a dry run before launch is the point. On launch day, set the
+# variable to `true`.
+#
+# Edit before use: the "What to deploy" block below. Replace THEME_NAME, or
+# use one of the other shapes in that block.
+# Needs: the secrets WPE_SSHG_KEY_PRIVATE, WPE_API_USER_ID and
+# WPE_API_PASSWORD, and the variables WPE_PROD_ENV and BACKUP_NOTIFICATION_EMAIL.
+
 on:
-  pull_request:
-    types: [closed]
-    branches:
-      - $default-branch
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to deploy, for example v1.2.0."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      # Release tags only. Pre-releases do not match, on purpose. A tag such as
+      # v1.2.3-rc.1 does not deploy, so you can tag a release candidate safely.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to deploy, for example v1.2.0. After a failed run, deploy the current tag again to roll forward."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  plan:
+    name: Plan
+    # if: vars.PROD_DEPLOY_ENABLED == 'true' || inputs.dry_run   # NOT YET LIVE: for a site that is not live yet, uncomment this line
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Resolve and check the tag
+        id: v
+        env:
+          # `inputs` is empty on the push path, where the tag is the ref.
+          TAG: ${{ inputs.tag || github.ref_name }}
+          # Not named GITHUB_*: GitHub reserves that prefix and ignores it.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # A regex, not a glob. The glob `v[0-9]*.[0-9]*.[0-9]*` also matches
+          # v1.2.3-rc.1. The dispatch and call paths have no tag filter.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Not a release tag::No deploy. '$TAG' is not a vX.Y.Z tag, and production deploys only a vX.Y.Z tag."
+            exit 1
+          fi
+
+          # A tag that is not on the default branch was cut on a feature branch,
+          # or moved later. Every commit on the default branch went through
+          # staging, because staging deploys on merge. A tag off the default
+          # branch went through nothing.
+          # Checkout above fetched the full history but checked out a tag, so
+          # the remote-tracking ref for the default branch may not exist. Fetch
+          # it by name (as origin/trunk), and do not assume it exists.
+          git fetch --no-tags --force origin "${DEFAULT_BRANCH}:refs/remotes/origin/trunk"
+          SHA="$(git rev-parse "${TAG}^{commit}")"
+          if ! git merge-base --is-ancestor "$SHA" origin/trunk; then
+            echo "::error title=Tag is not on the default branch::No deploy. ${TAG} (${SHA}) is not on the default branch, so it did not go through staging. Merge the work, let staging deploy it, then tag from the default branch."
+            git log --format='%H %s' "${TAG}" --not origin/trunk | head -n 50
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "${TAG} (${SHA}) is on the default branch."
+
   deploy:
-    if: github.event.pull_request.merged == true
-    uses: 434marketing/.github/.github/workflows/wpe-deploy-prod.yml@v1
+    needs: plan
+    # The concurrency group is on this job, not on the workflow, so a run that
+    # will not deploy takes no place in the queue. GitHub keeps 1 pending run
+    # per group, and a newer pending run cancels it. With a workflow-level
+    # group, a dry run could cancel a real deploy that waited its turn. Dry runs
+    # get their own group.
+    concurrency:
+      group: deploy-production${{ inputs.dry_run && '-dry-run' || '' }}
+      cancel-in-progress: false
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
-      theme_path: themes/THEME_NAME/
+      wpe_env: ${{ vars.WPE_PROD_ENV }}
+      # What to deploy. Replace THEME_NAME. Keep this block the same in
+      # dev.yaml, stage.yaml and prod.yaml.
+      # A theme (the default):
+      src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      lint_paths: themes/THEME_NAME
+      # A plugin in a subfolder:
+      #   src_path: plugins/PLUGIN_SLUG/
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: plugins/PLUGIN_SLUG
+      # A site repo whose root is the plugin:
+      #   src_path: ./
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: .
+      # A theme, a plugin and a mu-plugin in 1 deploy, with 1 backup. `targets`
+      # replaces src_path and remote_path, and the targets deploy in the order
+      # listed. Put the mu-plugin folder before its loader file. See 'Several
+      # targets in one deploy' in the 434marketing/.github README.
+      #   targets: >-
+      #     [{"src_path": "themes/THEME_NAME/", "remote_path": "wp-content/themes/THEME_NAME/"},
+      #      {"src_path": "plugins/PLUGIN_SLUG/", "remote_path": "wp-content/plugins/PLUGIN_SLUG/"},
+      #      {"src_path": "mu-plugins/PKG/", "remote_path": "wp-content/mu-plugins/PKG/"},
+      #      {"src_path": "mu-plugins/PKG-loader.php", "remote_path": "wp-content/mu-plugins/PKG-loader.php"}]
+      #   lint_paths: themes/THEME_NAME plugins/PLUGIN_SLUG mu-plugins
+      ref: ${{ needs.plan.outputs.tag }}
+      version: ${{ needs.plan.outputs.tag }}
+      environment: production
+      dry_run: ${{ inputs.dry_run || false }}
+      # Take a backup (a WP Engine on-demand restore point) before rsync starts.
+      # A dry run takes none.
+      backup: true
+      # Both true, and neither is optional on production.
+      # `backup_required`: no backup, no deploy.
+      # `backup_wait`: the backup is complete before rsync starts. A 202 from
+      # WP Engine means requested, not taken. A backup that runs at the same
+      # time as the deploy cannot restore the code you change.
+      backup_required: true
+      backup_wait: true
     secrets: inherit

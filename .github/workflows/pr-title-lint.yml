@@ -1,18 +1,19 @@
 name: Lint PR title
 
-# `main` allows squash and rebase merges only, and squash is the normal path --
-# which means the PR TITLE becomes the commit message on `main`, and that commit
-# message is the only thing release-please reads to decide the next version.
+# `main` allows only squash and rebase merges, and squash is the normal path.
+# With a squash merge, the PR title becomes the commit message on `main`.
+# release-please reads only that commit message to decide the next version.
 #
-# A title like "Update the deploy workflow" parses as nothing, cuts no release,
-# and appears in no changelog. That is a silent failure, so it is gated here.
+# A title like "Update the deploy workflow" parses as nothing. It cuts no
+# release and appears in no changelog. That failure is silent, so this workflow
+# blocks it.
 #
-# NOTE: this only guards the squash path. If you rebase-merge instead, every
-# individual commit message on the branch is what release-please sees, and this
-# check says nothing about them.
+# Note: this check covers only the squash path. With a rebase merge,
+# release-please reads each commit message on the branch, and this check does
+# not look at them.
 #
-# Delete this file if you would rather not gate PRs; release-please works
-# without it, just less predictably.
+# If you do not want to gate PRs, delete this file. release-please works
+# without it, but less predictably.
 
 on:
   pull_request:
@@ -28,7 +29,7 @@ jobs:
     steps:
       - name: Check the title
         env:
-          # Via env, never inline in the script: a PR title is untrusted input.
+          # Through `env`, never inline in the script: a PR title is untrusted input.
           TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
@@ -62,25 +63,25 @@ jobs:
             echo ""
             echo "\`$TITLE\`"
             echo ""
-            # release-please releases a type if that type is VISIBLE in
-            # changelog-sections; a hidden type produces empty release notes and
-            # no release. Keep this list in step with .github/release-please-config.json.
+            # release-please releases a type only if the type is visible in
+            # changelog-sections. A hidden type gives empty release notes and no
+            # release. Keep this list in step with .github/release-please-config.json.
             case "$TITLE" in
               *'!:'*)
-                echo "This is a **breaking change** — it will cut a new MAJOR (\`v2\`)."
+                echo "This is a **breaking change**. It cuts a new major version."
                 echo ""
-                echo "Sites on \`@v1\` will NOT receive it until each one's \`uses:\` line is updated by hand. Make sure that is what you mean."
+                echo "Site repos on the current major tag do not get it until someone edits the \`uses:\` line in each one by hand. Make sure that is what you mean."
                 ;;
               feat*)
-                echo "Cuts a **MINOR**. Every site on \`@v1\` picks it up automatically."
+                echo "Adds this change to the Release PR, which then cuts at least a **minor** version. After the Release PR merges, every site repo on the current major tag gets it on its next deploy."
                 ;;
               chore*|ci*|build*|test*|style*)
-                echo "\`$TYPE\` is a hidden type: this cuts **no release**, and will not appear in any changelog."
+                echo "\`$TYPE\` is a hidden type. This PR cuts **no release** and appears in no changelog."
                 echo ""
-                echo "If this change alters what the shared workflows actually do, retitle it \`fix:\` or \`feat:\` — otherwise it sits on \`main\` and never reaches a site."
+                echo "With this title, the change waits on \`main\` until an unrelated change cuts a release. If it alters what the shared workflows do, retitle it \`fix:\` or \`feat:\`."
                 ;;
               *)
-                echo "Cuts a **PATCH**. Every site on \`@v1\` picks it up automatically."
+                echo "Adds this change to the Release PR, which then cuts at least a **patch** version. After the Release PR merges, every site repo on the current major tag gets it on its next deploy."
                 ;;
             esac
           } >> "$GITHUB_STEP_SUMMARY"

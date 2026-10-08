@@ -1,0 +1,77 @@
+name: Deploy to WP Engine Dev
+
+# Caller for the dev environment. Every push to an open pull request deploys
+# to the dev install. You can then review the change on a real site before you
+# merge it.
+#
+# Add this file only to a site repo that has a dev install. Most 434 sites do
+# not have one. A dev install is normally made for an in-place rebuild. The
+# live site stays up while the team builds the new site beside it.
+#
+# If the site repo has no dev install, leave this file out. A pull request then
+# deploys nowhere, and a merge deploys to staging. This is the v2 default, and
+# it is deliberate. See the note at the top of stage.yaml.
+#
+# Edit before use: the "What to deploy" block below. Replace THEME_NAME, or
+# use one of the other shapes in that block.
+# Needs: the secret WPE_SSHG_KEY_PRIVATE and the variable WPE_DEV_ENV.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  # 1 group for the install, not 1 per PR. Every open PR deploys to the same
+  # dev install, and 2 concurrent `rsync --delete` runs from different trees
+  # would delete each other's files. The newest push from any PR wins.
+  #
+  # cancel-in-progress is true here, and false on staging and production. It is
+  # safe to cancel a dev deploy that a newer push replaces. Dev takes no real
+  # traffic, and the newer run overwrites the install anyway.
+  # A cancelled run never starts rsync, because the shared workflow gates the
+  # deploy job on `!cancelled()`. If a run stops during rsync, the live files
+  # stay as they were, because `--delay-updates` holds every update until the
+  # end. The run also leaves a `.~tmp~` holding directory, which the next run
+  # normally clears. Dev can accept that. A site with users cannot.
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
+    with:
+      wpe_env: ${{ vars.WPE_DEV_ENV }}
+      # What to deploy. Replace THEME_NAME. Keep this block the same in
+      # dev.yaml, stage.yaml and prod.yaml.
+      # A theme (the default):
+      src_path: themes/THEME_NAME/
+      remote_path: wp-content/themes/THEME_NAME/
+      lint_paths: themes/THEME_NAME
+      # A plugin in a subfolder:
+      #   src_path: plugins/PLUGIN_SLUG/
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: plugins/PLUGIN_SLUG
+      # A site repo whose root is the plugin:
+      #   src_path: ./
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: .
+      # A theme, a plugin and a mu-plugin in 1 deploy. `targets` replaces
+      # src_path and remote_path, and the targets deploy in the order listed.
+      # Put the mu-plugin folder before its loader file. See 'Several targets
+      # in one deploy' in the 434marketing/.github README.
+      #   targets: >-
+      #     [{"src_path": "themes/THEME_NAME/", "remote_path": "wp-content/themes/THEME_NAME/"},
+      #      {"src_path": "plugins/PLUGIN_SLUG/", "remote_path": "wp-content/plugins/PLUGIN_SLUG/"},
+      #      {"src_path": "mu-plugins/PKG/", "remote_path": "wp-content/mu-plugins/PKG/"},
+      #      {"src_path": "mu-plugins/PKG-loader.php", "remote_path": "wp-content/mu-plugins/PKG-loader.php"}]
+      #   lint_paths: themes/THEME_NAME plugins/PLUGIN_SLUG mu-plugins
+      environment: dev
+      # No backup (a WP Engine on-demand restore point) on dev. Dev is a scratch
+      # environment. WP Engine also keeps its own automatic daily backup, which
+      # this workflow does not take. A backup on every push to every PR is
+      # noise, and it makes the staging and production backups harder to find.
+      backup: false
+    secrets: inherit

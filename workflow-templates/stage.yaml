@@ -1,13 +1,197 @@
 name: Deploy to WP Engine Staging
 
+# Caller for the staging environment. A pull request deploys to staging when it
+# merges into the default branch, not when it opens.
+#
+# This is 1 of the 2 trigger changes in v2. Both affect every existing site
+# repo, and the other is in prod.yaml. In v1 this template ran on
+# `pull_request: [opened, synchronize, reopened]`, so every push to any open PR
+# overwrote the staging code. With 2 open PRs, staging showed the last push,
+# and nothing said so.
+#
+# v2 splits the 2 old uses of staging:
+#
+#   "Let me see this change on a real site"  ->  the dev install (dev.yaml),
+#                                                or a manual run of this workflow
+#   "This is what we are about to release"   ->  staging, on merge
+#
+# To put a PR branch on staging anyway, start a manual run. It is deliberate
+# and visible:
+#   Actions -> Deploy to WP Engine Staging -> Run workflow -> pick the branch.
+# `workflow_dispatch` runs this file from the ref you choose. The branch goes to
+# staging when you decide, and the run records who started it.
+#   gh workflow run stage.yaml --ref my-branch
+# For a dry run, add `-f dry_run=true`. A dry run writes nothing.
+#
+# If the site repo has no dev install and you want the v1 convenience back, add
+# the open-PR actions to `types` below:
+#   types: [closed, opened, synchronize, reopened]
+# The plan job already handles both shapes, so this 1 edit is the whole change.
+# Know the cost: with that setting, any push to any open PR deploys to staging.
+# That is fine when only 1 person pushes, and a risk when 2 or more do.
+#
+# Edit before use: the "What to deploy" block below. Replace THEME_NAME, or
+# use one of the other shapes in that block.
+# Needs: the secret WPE_SSHG_KEY_PRIVATE and the variable WPE_STAGE_ENV. For
+# backups, also the secrets WPE_API_USER_ID and WPE_API_PASSWORD and the
+# variable BACKUP_NOTIFICATION_EMAIL.
+
 on:
+  # No `branches:` filter. GitHub replaces its default-branch placeholder only
+  # when you create the workflow from the template in the Actions UI. A
+  # hard-coded `main` is wrong for site repos that use `master` or `develop`.
+  # The plan job compares the PR base with the default branch instead.
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: preflight, lint and resolve the install; write nothing."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
+  # Decides if this event deploys, and which ref. This is its own job because
+  # the `if:` of a job that calls a shared workflow cannot read a shell result.
+  # It can read only the outputs of a job that ran first.
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      ref: ${{ steps.gate.outputs.ref }}
+    steps:
+      - name: Decide deploy / skip
+        id: gate
+        env:
+          # Every user-controlled value reaches the shell through `env`, never
+          # through `${{ }}` inside `run`. GitHub substitutes `${{ }}` as text
+          # before bash parses the line. A branch name or PR title that holds
+          # `$( )` would then run on a runner that holds the deploy key.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          HAS_SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-deploy') }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          emit() { printf 'deploy=%s\nref=%s\n' "$1" "${2:-}" >> "$GITHUB_OUTPUT"; }
+
+          # Manual run: deploy the ref that the run started from.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run against ${GITHUB_REF}."
+            emit true "$GITHUB_SHA"
+            exit 0
+          fi
+
+          # Only a PR into the default branch deploys to staging. A PR into a
+          # feature branch is not part of the next release.
+          if [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::notice title=Deploy skipped::This PR targets '${BASE_REF}', not the default branch '${DEFAULT_BRANCH}'."
+            emit false
+            exit 0
+          fi
+
+          # To merge without a deploy, put the `skip-deploy` label on the PR.
+          # Why a label, and not a token in the commit message or PR title? A
+          # squash merge makes the PR title the permanent commit subject on the
+          # default branch. release-please writes the changelog line from that
+          # subject. The same squash discards a token in a branch commit. A
+          # label has neither problem. It is in the event payload at merge time,
+          # and you can query it later:
+          # `gh pr list --label skip-deploy --state merged`.
+          # Create the label once in each site repo:
+          #   gh label create skip-deploy --color BFD4F2 --description "Merge without deploying"
+          if [ "$HAS_SKIP_LABEL" = "true" ]; then
+            echo "::notice title=Deploy skipped::The skip-deploy label is on this PR."
+            emit false
+            exit 0
+          fi
+
+          # `closed` also fires when a PR closes without a merge. Only a merge
+          # deploys.
+          if [ "$PR_ACTION" = "closed" ]; then
+            if [ "$MERGED" = "true" ]; then
+              # Deploy the merge commit on the base branch, not
+              # refs/pull/N/merge. That ref is a pre-merge test ref, and it may
+              # not exist after the PR closes.
+              emit true "$MERGE_SHA"
+            else
+              echo "::notice title=Deploy skipped::The PR closed without a merge."
+              emit false
+            fi
+            exit 0
+          fi
+
+          # The run gets here only if someone added the open-PR actions to `types`.
+          echo "::warning title=Staging deploy from an open pull request::2 open PRs overwrite each other on staging. This site repo deploys every PR update to staging."
+          emit true "$HEAD_SHA"
+
   deploy:
-    uses: 434marketing/.github/.github/workflows/wpe-deploy-staging.yml@v1
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true'
+    # The concurrency group is on this job, not on the workflow, so only runs
+    # that will deploy wait here. GitHub keeps 1 pending run per group, and a
+    # newer pending run cancels it. At workflow level, a PR closed without a
+    # merge, or a merge with `skip-deploy`, would cancel the pending deploy of a
+    # merged PR. Staging would then be 1 merge behind. Between 2 real deploys,
+    # the newer one must replace the older one, and it does.
+    # cancel-in-progress is false. Inside 1 target, `--delay-updates` keeps the
+    # live files as they were until the end of the rsync. But a deploy with
+    # several targets that stops between 2 targets leaves staging between 2
+    # commits.
+    concurrency:
+      group: deploy-staging${{ inputs.dry_run && '-dry-run' || '' }}
+      cancel-in-progress: false
+    uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@v2
     with:
-      theme_path: themes/THEME_NAME/
+      wpe_env: ${{ vars.WPE_STAGE_ENV }}
+      # What to deploy. Replace THEME_NAME. Keep this block the same in
+      # dev.yaml, stage.yaml and prod.yaml.
+      # A theme (the default):
+      src_path: themes/THEME_NAME/
       remote_path: wp-content/themes/THEME_NAME/
+      lint_paths: themes/THEME_NAME
+      # A plugin in a subfolder:
+      #   src_path: plugins/PLUGIN_SLUG/
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: plugins/PLUGIN_SLUG
+      # A site repo whose root is the plugin:
+      #   src_path: ./
+      #   remote_path: wp-content/plugins/PLUGIN_SLUG/
+      #   lint_paths: .
+      # A theme, a plugin and a mu-plugin in 1 deploy, with 1 backup. `targets`
+      # replaces src_path and remote_path, and the targets deploy in the order
+      # listed. Put the mu-plugin folder before its loader file. See 'Several
+      # targets in one deploy' in the 434marketing/.github README.
+      #   targets: >-
+      #     [{"src_path": "themes/THEME_NAME/", "remote_path": "wp-content/themes/THEME_NAME/"},
+      #      {"src_path": "plugins/PLUGIN_SLUG/", "remote_path": "wp-content/plugins/PLUGIN_SLUG/"},
+      #      {"src_path": "mu-plugins/PKG/", "remote_path": "wp-content/mu-plugins/PKG/"},
+      #      {"src_path": "mu-plugins/PKG-loader.php", "remote_path": "wp-content/mu-plugins/PKG-loader.php"}]
+      #   lint_paths: themes/THEME_NAME plugins/PLUGIN_SLUG mu-plugins
+      ref: ${{ needs.plan.outputs.ref }}
+      environment: staging
+      dry_run: ${{ inputs.dry_run || false }}
+      # Request a backup (a WP Engine on-demand restore point) before rsync
+      # starts. A dry run takes none.
+      backup: true
+      # Warn, do not block. Staging takes every merge, and a credential problem
+      # must not block deploys from the default branch. After the summary of a
+      # real run shows `Backup: taken`, set this to true. That 1-line edit is the
+      # whole change.
+      backup_required: false
+      # Do not wait for the backup. A WP Engine backup takes many minutes, and
+      # staging deploys are frequent. As a result, the backup runs at the same
+      # time as rsync. It can restore the database and uploads, but it is not an
+      # exact copy of the code before the deploy. Git holds the code.
+      backup_wait: false
     secrets: inherit

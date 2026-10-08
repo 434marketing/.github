@@ -1,38 +1,39 @@
 name: Update major version tag
 
-# Force-move the floating `v1` tag to a release tag like v1.2.3.
-# Sites reference @v1 by default, so this is what actually delivers a release
-# to them. A forgotten force-push leaves @v1 on a stale commit and the release
-# reaches nobody -- that is the failure mode this exists to prevent.
+# Force-moves the floating major tag, for example `v2`, to a release tag such
+# as v2.1.3. Site repos reference the major tag (`@v2`), so this move delivers
+# a release to them. Without the move, `@v2` stays on an old commit and the
+# release reaches no site repo. This workflow exists to prevent that failure.
 #
-# THREE ENTRY POINTS, one implementation:
+# 3 entry points, 1 implementation:
 #
-#   workflow_call   The normal path. release-please.yml calls this right after
-#                   it cuts a release. It has to call rather than rely on the
-#                   `push` trigger below, because a tag created with
-#                   GITHUB_TOKEN does not trigger other workflows.
-#   push (tags)     Fallback for a tag pushed by hand from a laptop, which does
-#                   trigger workflows.
-#   workflow_dispatch  Repair. Use it if `v1` ever ends up pointing at the
-#                   wrong commit; pass the vX.Y.Z tag it should point at.
+#   workflow_call      The normal path. release-please.yml calls this right after
+#                      it cuts a release. It must call, and not rely on the
+#                      `push` trigger below, because a tag created with
+#                      GITHUB_TOKEN starts no other workflow.
+#   push (tags)        Fallback for a tag pushed by hand from a laptop. That
+#                      push does start workflows.
+#   workflow_dispatch  Repair. If the major tag ever points at the wrong commit,
+#                      run this with the vX.Y.Z tag it must point at.
 #
-# The operation is idempotent -- it is safe if two paths fire for the same tag.
+# The operation is idempotent: if 2 paths run for the same tag, the result is
+# the same.
 
 on:
   push:
     tags:
-      # Deliberately excludes pre-releases (v1.2.3-beta.1 will not match).
+      # Pre-releases do not match, on purpose. Example: v2.1.3-beta.1.
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_call:
     inputs:
       tag:
-        description: "Release tag to point v<major> at (e.g. v1.2.3)"
+        description: "Release tag that v<major> must point at, for example v2.1.3."
         required: true
         type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to point v<major> at (e.g. v1.2.3)"
+        description: "Release tag that v<major> must point at, for example v2.1.3."
         required: true
         type: string
 
@@ -49,28 +50,27 @@ jobs:
 
       - name: Move v<major> to this release
         env:
-          # `inputs` is empty on the push path, where the tag is the ref itself.
+          # `inputs` is empty on the push path, where the tag is the ref.
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
 
-          # Guard the dispatch and call paths: github.ref_name is `main` when
-          # this is called from release-please.yml, so a missing or malformed
-          # input must fail loudly rather than tag `v1` at `main`.
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "::error title=Not a release tag::Refusing to act on '$TAG'. Expected a vX.Y.Z tag."
-              exit 1
-              ;;
-          esac
+          # Guard the dispatch and call paths. When release-please.yml calls this
+          # workflow, github.ref_name is `main`. A missing or malformed input
+          # must fail the run, and must not point the major tag at `main`.
+          # A regex, not a glob: the glob v[0-9]*.[0-9]*.[0-9]* also matches a
+          # pre-release such as v2.1.0-rc.1, which must never become `v2`.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Not a release tag::No tag moved. '$TAG' is not a vX.Y.Z tag. Give a release tag such as v2.1.3."
+            exit 1
+          fi
 
-          # release-please creates the tag through the API moments earlier, so
-          # make sure this checkout has it before pointing anything at it.
+          # release-please creates the tag through the API a moment earlier.
+          # Fetch it into this checkout before anything points at it.
           git fetch --force --tags origin
 
           if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error title=Tag not found::'$TAG' does not exist in this repository."
+            echo "::error title=Tag not found::No tag moved. '$TAG' does not exist in this repository."
             exit 1
           fi
 
@@ -85,5 +85,5 @@ jobs:
           {
             echo "### Moved \`$MAJOR\` → \`$TAG\`"
             echo ""
-            echo "Every site referencing \`@$MAJOR\` picks this up on its next deploy."
+            echo "Every site repo that references \`@$MAJOR\` gets this release on its next deploy."
           } >> "$GITHUB_STEP_SUMMARY"

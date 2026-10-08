@@ -1,6 +1,6 @@
 {
   "name": "WP Engine Staging Deploy",
-  "description": "Deploys the theme to WP Engine staging on every pull request. Requires WPE_SSHG_KEY_PRIVATE secret and WPE_STAGE_ENV variable.",
+  "description": "Deploys a theme, plugin or mu-plugin to WP Engine staging when a pull request merges into the default branch. Also deploys any branch with Run workflow. Takes a labeled backup (a restore point) before each deploy. Needs the WPE_SSHG_KEY_PRIVATE secret and the WPE_STAGE_ENV variable. For backups, also needs the WPE_API_USER_ID and WPE_API_PASSWORD secrets and the BACKUP_NOTIFICATION_EMAIL variable.",
   "iconName": "octicon-rocket",
   "categories": ["Deployment"]
 }

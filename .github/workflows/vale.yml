@@ -1,0 +1,34 @@
+# Lints Markdown against the 434 technical doc standard on every PR that
+# changes a .md file. Errors block the merge. Warnings post as review comments
+# on changed lines only. Suggestions (passive voice) do not post; run `vale`
+# locally to see them.
+#
+# Source of record: the technical-doc-standard skill in 434-claude-plugins
+# (assets/vale/). Copy changes from there, not the other way around.
+name: Lint docs
+
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".vale.ini"
+      - "styles/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  vale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # v3, not v2: in v2, fail_on_error failed the run on a finding of ANY
+      # severity, so 1 passive-voice suggestion blocked the merge.
+      - uses: errata-ai/vale-action@v3
+        with:
+          files: all
+          reporter: github-pr-review
+          filter_mode: added
+          min_alert_level: warning
+          fail_level: error
