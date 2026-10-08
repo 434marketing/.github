@@ -1,11 +1,10 @@
 version: 2
 updates:
   # Keeps the actions in the shared workflows current. They include
-  # actions/checkout, actions/setup-node, shivammathur/setup-php,
-  # softprops/action-gh-release and wpengine/github-action-wpe-site-deploy.
-  # After a release, a bump here reaches every site repo on the current major
-  # tag (`@v2`). It does not reach `@v1`. A site repo that still calls at
-  # `@main` gets it at merge. Review these PRs like any other change.
+  # actions/checkout, actions/setup-node, shivammathur/setup-php and
+  # wpengine/github-action-wpe-site-deploy. After a release, a bump here
+  # reaches every site repo on the current major tag (`@v2`). It does not
+  # reach `@v1`, which stays at v1.1.3. Review these PRs like any other change.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -28,6 +27,6 @@ updates:
     # No `labels:` here, on purpose. The version of this repo comes from the
     # commit message, not from labels. See .github/workflows/release-please.yml.
     #
-    # The major/minor/patch labels drove the deprecated v1 wpe-deploy-prod.yml
-    # in site repos. v2 dropped them: release-please sets the version in site
+    # The major/minor/patch labels drove the v1 wpe-deploy-prod.yml in site
+    # repos. v2 dropped them: release-please sets the version in site
     # repos too. A label on a PR here would only suggest that it does something.

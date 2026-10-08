@@ -51,7 +51,7 @@ This README uses each term below for one meaning only. The third column lists wo
 |---|---|---|
 | site repo | The client's GitHub repository that holds one WordPress site's theme, plugins or mu-plugins. | client repo, project repo, calling repo |
 | caller | A workflow in the site repo (`dev.yaml`, `stage.yaml`, `prod.yaml`, `release-please.yaml`) that calls a shared workflow. | calling workflow, wrapper |
-| shared workflow | A reusable workflow in `434marketing/.github`: `wpe-deploy.yml`, and the v1 pair. | reusable deploy, org workflow |
+| shared workflow | A reusable workflow in `434marketing/.github`: `wpe-deploy.yml`. The v1 pair exists only at the `v1` tag. | reusable deploy, org workflow |
 | template | A file in `workflow-templates/` or `client-repo-templates/` that a site repo copies. | starter workflow |
 | environment | One of `dev`, `staging`, `production`. It is also the name of the GitHub Environment that records each deploy. | env, tier, stage (as a noun for the environment) |
 | install | The WP Engine install that serves one environment, for example `mysitestg`. WP Engine's API and SSH gateway use this word. | site (for an install), WP Engine environment, env |
@@ -338,27 +338,36 @@ is normally off.
 
 > [!IMPORTANT]
 > Production cannot deploy if these files land apart. `release-please.yaml` calls
-> `prod.yaml`, and a v1 `prod.yaml` has no `workflow_call` trigger. Put steps 2 to 8 in one PR.
+> `prod.yaml`, and a v1 production caller has no `workflow_call` trigger. Put steps 2 to 10 in one PR.
 
 1. Create a branch in the site repo.
 2. Do [4. Add the release-please files](#4-add-the-release-please-files) from the setup procedure.
    - **Result:** the manifest and `.github/VERSION` hold the newest v1 tag's version.
 3. Add `release-please.yaml` from the template.
-4. Replace `prod.yaml` with the v2 template.
-5. Replace `stage.yaml` with the v2 template.
-6. If the site has a dev install, add `dev.yaml`.
+
+> [!CAUTION]
+> Production deploys on every merge. If a v1 production caller stays next to the v2 one,
+> it keeps deploying on merge and cutting label-driven tags. Delete it in this PR.
+
+4. Delete the v1 callers: `prod.yml` and `stage.yml`. A few site repos use `prod.yaml` and `stage.yaml`.
+5. Add `prod.yaml` and `stage.yaml` from the v2 templates. Keep the `.yaml` names.
+   - `release-please.yaml` calls `./.github/workflows/prod.yaml`, so another name fails at startup.
+6. Check that no v1 caller is left: `grep -lE 'wpe-deploy-(prod|staging)\.yml' .github/workflows/*`.
+   - **Result:** the command prints nothing.
+7. If the site has a dev install, add `dev.yaml`.
 
 > [!NOTE]
 > If the v1 `theme_path` has no trailing `/`, add one. Preflight refuses a directory
 > `src_path` without it.
 
-7. In the `What to deploy` block of each caller, set `src_path` to the v1 `theme_path` value.
-8. In the same block, set `remote_path` to the v1 `remote_path` value.
+8. In the `What to deploy` block of each caller, set `src_path` to the v1 `theme_path` value.
+9. In the same block, set `remote_path` to the v1 `remote_path` value.
    - **Result:** all callers have the same `src_path`, `remote_path` and `lint_paths`.
-9. Put the `skip-deploy` label on the PR.
-10. Tell the people who work in the site repo that staging now deploys on merge, not on a PR update.
-11. Merge the PR.
-    - **Result:** the `Deploy to WP Engine Staging` run skips the deploy.
+10. Put the `skip-deploy` label on the PR.
+11. Tell the people who work in the site repo that staging now deploys on merge, not on a PR update.
+12. Merge the PR.
+    - **Result:** the `Deploy to WP Engine Staging` run skips the deploy. No production
+      deploy runs: the merge uses the PR's own workflow files, which no longer hold a v1 caller.
 
 #### 3. Check the manifest after the merge
 
@@ -399,7 +408,8 @@ PR, the manifest is behind again.
 1. If you deleted the `major`, `minor` and `patch` labels, create them again.
 2. If you removed `WPE_INSTALL_ID`, add it again.
 3. Open a revert PR with the `Revert` button on the merged migration PR.
-4. If the reverted callers use `@main`, change each `uses:` line in the revert PR to `@v1`.
+4. Make sure each `uses:` line in the revert PR ends in `@v1`, not `@main`.
+   - The v1 shared workflows are not on `main`. A `uses:` line at `@main` fails at startup.
 
 > [!CAUTION]
 > Production deploy. The revert restores the v1 `prod.yaml`, which deploys production
@@ -409,7 +419,7 @@ PR, the manifest is behind again.
 5. Merge the revert PR.
    - **Result:** the v1 callers run again.
 
-The v1 shared workflows at `@v1` stay unchanged, so the reverted callers work as before.
+The `v1` tag still points at `v1.1.3`, so the reverted callers work as before.
 
 ## `wpe-deploy.yml` reference
 
@@ -1081,7 +1091,7 @@ The first step of `release-please.yaml` refuses to run in that state, and points
 5. If the command fails, set the top-level `"last-release-sha"` to the output of `git rev-list -n1 v1.4.2`.
    - **Result:** the changelog starts after `v1.4.2`. Without it, the changelog lists all
      history again.
-6. If a v1 `prod.yaml` exists, replace it with the v2 template in the PR for steps 2 to 5.
+6. If a v1 production caller exists (`prod.yml` or `prod.yaml`), delete it in the PR for steps 2 to 5. Add the v2 `prod.yaml`.
 7. After the PR merges, do step 1 again.
 8. If there is a newer tag, update the manifest to it before you merge any Release PR.
    - **Result:** the first Release PR proposes the next version, for example `1.4.3` or
@@ -1125,10 +1135,17 @@ See [Cut a release of this repo](#cut-a-release-of-this-repo).
 
 ## v1 shared workflows
 
-`wpe-deploy-staging.yml` and `wpe-deploy-prod.yml` are the v1 shared workflows. They are
-deprecated. They receive no new features. Their interface stays the same, so nothing
-pinned to `@v1` breaks. To move a site repo to v2, use
-[Migrate a site repo from v1](#migrate-a-site-repo-from-v1).
+`wpe-deploy-staging.yml` and `wpe-deploy-prod.yml` are the v1 shared workflows. v2.0.0
+removed them from `main`. They still exist at the `v1` tag, which points at `v1.1.3`, so
+a site repo that calls them at `@v1` keeps working. v1 gets no further releases. To move
+a site repo to v2, use [Migrate a site repo from v1](#migrate-a-site-repo-from-v1).
+
+> [!CAUTION]
+> Failed deploys. A `uses:` line that calls a v1 shared workflow at `@main`, or at any
+> branch, fails at startup, because the files are not on `main`. Always call v1 at `@v1`.
+
+To read the v1 files, open them at the tag:
+[`v1.1.3/.github/workflows`](https://github.com/434marketing/.github/tree/v1.1.3/.github/workflows).
 
 | | `wpe-deploy-staging.yml` | `wpe-deploy-prod.yml` |
 |---|---|---|
@@ -1142,15 +1159,37 @@ pinned to `@v1` breaks. To move a site repo to v2, use
 > `BACKUP_EMAIL_NOTIFICATION`, but the workflow always read the first name (fixed in
 > `08d0020`). If you set the name this README used to give, unset it.
 
-On 2026-10-08, 14 site repos called the v1 shared workflows: 9 at `@main` and 5 at
-`@v1`. kbc inlines its own copy and is not counted. No site repo used v2 yet.
+On 2026-10-08, 14 site repos called the v1 shared workflows, all at `@v1`. 9 of them
+moved from `@main` to `@v1` that day, before v2.0.0 removed the files. kbc inlines its own
+copy and is not counted. No site repo used v2 yet.
 
-| Reference | Site repos |
-|---|---|
-| `@main` (9) | Infinite-Hero-Foundation, community-access-network, flylyh, impact-services, lyh-museum, lynchburg-eda, noble-warriors, soar-ministry-coaching, warrior-fellowship |
-| `@v1` (5) | center-for-early-success, dodson-pest-control, home-in-him, institute-for-advanced-learning-and-research-ialr, sbcv |
+The 14 site repos on `@v1`:
 
-`@main` is never correct. See [References](#references).
+- center-for-early-success
+- community-access-network
+- dodson-pest-control
+- flylyh
+- home-in-him
+- impact-services
+- Infinite-Hero-Foundation
+- institute-for-advanced-learning-and-research-ialr
+- lyh-museum
+- lynchburg-eda
+- noble-warriors
+- sbcv
+- soar-ministry-coaching
+- warrior-fellowship
+
+#### Fix v1 in an emergency
+
+v1 gets no planned releases. If a v1 site repo needs an urgent fix before it migrates:
+
+1. Create a branch from the tag: `git switch -c v1-maintenance v1.1.3`.
+2. Fix the v1 file in `.github/workflows/`. The branch still has both v1 files.
+3. Open a PR into `v1-maintenance`, not `main`, and merge it.
+4. Tag the merge commit `v1.1.4` and push the tag.
+5. Run [`update-major-tag.yml`](.github/workflows/update-major-tag.yml) with `tag: v1.1.4`.
+   - **Result:** `v1` points at `v1.1.4`, and every `@v1` site repo gets the fix.
 
 ## Maintain this repo
 
@@ -1165,7 +1204,7 @@ is still published and still receives fixes.
 | Reference | Behaviour | Use when |
 |---|---|---|
 | `@v2` | **Default.** Tracks the newest `v2.x.y`. Fixes and features arrive automatically. Breaking changes never do. | Almost always |
-| `@v1` | Same contract, previous major. Fixes only. | A site repo that is not migrated yet |
+| `@v1` | Previous major, frozen at `v1.1.3`. The files are not on `main`. | A site repo that is not migrated yet |
 | `@v2.1.3` | Frozen at one release. Nothing reaches the site repo until someone changes it by hand. | A site repo in the middle of a migration, or a byte-reproducible deploy |
 | `@main` | Tracks every commit as it lands. | Never. Tags replaced this. |
 
@@ -1324,11 +1363,12 @@ release-please never scans the commits from before automation (`Initial commit`,
 ### Migrate to a new major
 
 Breaking changes go into the next major. They reach nobody until each site repo changes
-its `uses:` line. Keep fixes going to the previous major for a period, so site repos do
-not have to migrate on a deadline they did not choose.
+its `uses:` line. A site repo that does not migrate stays on its tag, so it does not
+have to migrate on a deadline it did not choose.
 
-`v1` is in that period now. The per-repo steps are in
-[Migrate a site repo from v1](#migrate-a-site-repo-from-v1).
+v2.0.0 removed the v1 files from `main`, so `v1` gets no planned releases. For an urgent
+v1 fix, see [Fix v1 in an emergency](#fix-v1-in-an-emergency). The per-repo steps to
+move are in [Migrate a site repo from v1](#migrate-a-site-repo-from-v1).
 
 ### A note on trust
 
@@ -1355,3 +1395,4 @@ uses: 434marketing/.github/.github/workflows/wpe-deploy.yml@<40-character SHA of
 | Date | Change | By |
 |---|---|---|
 | 2026-10-08 | Rewritten to the 434 technical doc standard for v2 | Adam + Claude |
+| 2026-10-08 | v1 shared workflows removed from `main`; v1 frozen at `v1.1.3`; fleet counts updated | Adam + Claude |

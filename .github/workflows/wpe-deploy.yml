@@ -2,7 +2,8 @@ name: WP Engine Deploy (shared workflow)
 
 # One shared workflow for every environment, and for themes, plugins and
 # mu-plugins. It replaces the v1 pair `wpe-deploy-staging.yml` and
-# `wpe-deploy-prod.yml`. The 2 v1 files differ only in configuration: the
+# `wpe-deploy-prod.yml`, which v2 removed from `main` (they stay at the `v1`
+# tag). The 2 v1 files differed only in configuration: the
 # install name, whether a backup runs first, and what runs after the rsync.
 # Configuration belongs in inputs, not in a second file that someone must keep
 # in step by hand.
