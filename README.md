@@ -724,6 +724,52 @@ is what deploys. Preflight runs again after the build. The lint job lints the so
 the build output. `node_modules` and `package.json` are in the default excludes, but
 `vendor/` is not.
 
+#### A build that needs a private package
+
+`composer install` resolving a package from a **private** repository gets a 404. The job
+token is scoped to the calling repository and reaches no other one.
+
+Pass a credential as the optional `COMPOSER_AUTH` secret:
+
+```yaml
+      setup_composer: true
+      build_command: composer install --no-dev --optimize-autoloader
+    secrets: inherit
+```
+
+with `COMPOSER_AUTH` on the calling repository, holding
+`{"github-oauth":{"github.com":"<token>"}}` — a GitHub App installation token for an App
+installed across the org, rather than a PAT per repository.
+
+Set it as a **secret**, not inside `build_command`. A command is echoed into the run log;
+a secret is masked.
+
+Leaving it unset changes nothing. An unset secret arrives as an empty string, and
+Composer treats an empty `COMPOSER_AUTH` as absent. (It warns `COMPOSER_AUTH environment
+variable is malformed` on a non-empty value it cannot parse, and says nothing on an empty
+one.) A site with no private packages is unaffected.
+
+#### Keeping docs out of wp-content
+
+Everything under `wp-content` is web accessible. A repo whose root is the package, and a
+Composer-installed package, both carry their `README.md`, `CHANGELOG.md` and `docs/` into
+the install, where they are served.
+
+`exclude_docs: true` adds all three to the excludes, instead of every caller repeating
+the same `extra_excludes` string:
+
+```yaml
+      exclude_docs: true
+      # extra_excludes still works, and adds to this rather than replacing it.
+      extra_excludes: "/assets/img/source/"
+```
+
+> [!CAUTION]
+> It defaults to `false` and stays there. The default flags include `--delete`, so
+> switching it on for a caller that has been deploying those files **removes them from
+> the install** on the next deploy. Usually what you want; never what you want by
+> surprise.
+
 #### A plugin with a PHP support floor
 
 `php_versions: '["7.4","8.4"]'` lints against each version in parallel.
