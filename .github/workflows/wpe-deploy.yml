@@ -161,6 +161,23 @@ on:
         required: false
         default: ""
         type: string
+      exclude_docs:
+        description: >
+          Append `/README.md /CHANGELOG.md /docs/` to the excludes. A repo whose
+          root is the package, and a Composer-installed package, both carry
+          these files into wp-content, where everything is web accessible.
+          Every caller that wants them gone repeats the same `extra_excludes`
+          string, so this is that string in one place.
+
+
+          DEFAULT false, and it stays false. The default rsync flags include
+          `--delete`, so switching this on for a caller that has been deploying
+          those files REMOVES them from the install on the next deploy. That is
+          usually what you want and it is never what you want by surprise, so
+          it is the caller's decision, not a new default. `extra_excludes` still
+          works, and adds to this rather than replacing it.
+        type: boolean
+        default: false
       build_command:
         description: >-
           Shell command that runs from the repo root after checkout and before
@@ -214,6 +231,28 @@ on:
         default: false
         type: boolean
     secrets:
+      COMPOSER_AUTH:
+        description: >
+          Optional. A JSON object for Composer authentication, handed to
+          `build_command` as COMPOSER_AUTH. Needed when `composer install`
+          resolves a package from a PRIVATE repository: the job token is scoped
+          to the calling repository, so Composer gets a 404 on any other one.
+          For example `{"github-oauth":{"github.com":"<token>"}}` from a GitHub
+          App installation token.
+
+
+          Leave it unset and nothing changes. An unset secret arrives as an
+          empty string, and Composer treats an empty COMPOSER_AUTH as absent —
+          checked against composer:2, which warns "COMPOSER_AUTH environment
+          variable is malformed" on a non-empty value it cannot parse and says
+          nothing at all on an empty one. So a site with no private packages is
+          unaffected.
+
+
+          Pass it as a secret rather than writing the token into
+          `build_command`: a command is echoed in the run log, a secret is
+          masked.
+        required: false
       WPE_SSHG_KEY_PRIVATE:
         description: "Passwordless SSH private key that the WP Engine SSH gateway accepts for this install."
         required: true
@@ -280,6 +319,7 @@ jobs:
           ALLOW_UNSAFE: ${{ inputs.allow_unsafe_remote_path }}
           RSYNC_FLAGS: ${{ inputs.rsync_flags }}
           EXTRA_EXCLUDES: ${{ inputs.extra_excludes }}
+          EXCLUDE_DOCS: ${{ inputs.exclude_docs }}
           LINT_PATHS: ${{ inputs.lint_paths }}
           PHP_VERSION: ${{ inputs.php_version }}
           PHP_VERSIONS: ${{ inputs.php_versions }}
@@ -320,7 +360,13 @@ jobs:
           if [ -z "${FLAGS//[[:space:]]/}" ]; then
             err "rsync_flags is empty, so the deploy action would use its own default, -azvr --inplace, which this workflow exists to avoid. Set rsync_flags, or remove it to keep this workflow's default."
           fi
-          words EXCLUDES "$EXTRA_EXCLUDES"
+          # One list, so the quote and backslash check below covers the
+          # built-in patterns as well as the caller's.
+          EXCLUDE_SOURCE="$EXTRA_EXCLUDES"
+          if [ "$EXCLUDE_DOCS" = "true" ]; then
+            EXCLUDE_SOURCE="${EXCLUDE_SOURCE} /README.md /CHANGELOG.md /docs/"
+          fi
+          words EXCLUDES "$EXCLUDE_SOURCE"
           for p in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
             case "$p" in
               *[\'\"\\]*) err "extra_excludes: '${p}' contains a quote or backslash. The deploy action parses the flags again with xargs, which would change the pattern. Remove the quote or backslash." ;;
@@ -960,6 +1006,10 @@ jobs:
         if: inputs.build_command != ''
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
+          # Empty when the caller sets no COMPOSER_AUTH secret, which Composer
+          # treats as absent. Set unconditionally so a build that needs it does
+          # not also need a second input to switch it on.
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
         run: bash -euo pipefail -c "$BUILD_COMMAND"
 
       # The same step as the preflight job (YAML alias), now against the built
