@@ -161,6 +161,23 @@ on:
         required: false
         default: ""
         type: string
+      exclude_docs:
+        description: >
+          Keep `README.md`, `CHANGELOG.md` and `docs/` at the top of each
+          target off the install, where everything under wp-content is web
+          accessible. The workflow appends sender-side hide rules
+          (`--filter=H_/README.md --filter=H_/CHANGELOG.md --filter=H_/docs/`),
+          not excludes. An exclude also shields the server's copy from
+          `--delete`, so a file already deployed would stay, stale and served.
+          A hide rule does not, so with `--delete` the next deploy REMOVES the
+          server's copy. `--delete` still acts only inside the target folder
+          that preflight allows. Defaults to false, so a caller decides when
+          that removal happens. Without `--delete` in `rsync_flags`, nothing is
+          removed. Do not also list these files in `extra_excludes`: an exclude
+          there still shields them, and preflight warns.
+        required: false
+        type: boolean
+        default: false
       build_command:
         description: >-
           Shell command that runs from the repo root after checkout and before
@@ -214,6 +231,22 @@ on:
         default: false
         type: boolean
     secrets:
+      COMPOSER_AUTH:
+        description: >
+          Optional. A JSON object for Composer authentication, for example
+          `{"github-oauth":{"github.com":"<token>"}}`, exported to
+          `build_command` as COMPOSER_AUTH. Needed when `composer install`
+          resolves a package from a PRIVATE repository: the job token reaches
+          only the calling repository. Use a fine-grained personal access token
+          with Contents read-only on the package repositories, an expiry date
+          and a named owner. A GitHub App installation token expires after 1
+          hour, and a caller cannot mint a new one for each run. Before the
+          build, the deploy job checks that the value is 1 JSON object and
+          masks every string in it of 8 or more characters. A value that is
+          not a JSON object fails the run, and the message shows none of it.
+          Unset, the build runs exactly as before, with no COMPOSER_AUTH in its
+          environment.
+        required: false
       WPE_SSHG_KEY_PRIVATE:
         description: "Passwordless SSH private key that the WP Engine SSH gateway accepts for this install."
         required: true
@@ -280,6 +313,7 @@ jobs:
           ALLOW_UNSAFE: ${{ inputs.allow_unsafe_remote_path }}
           RSYNC_FLAGS: ${{ inputs.rsync_flags }}
           EXTRA_EXCLUDES: ${{ inputs.extra_excludes }}
+          EXCLUDE_DOCS: ${{ inputs.exclude_docs }}
           LINT_PATHS: ${{ inputs.lint_paths }}
           PHP_VERSION: ${{ inputs.php_version }}
           PHP_VERSIONS: ${{ inputs.php_versions }}
@@ -326,7 +360,21 @@ jobs:
               *[\'\"\\]*) err "extra_excludes: '${p}' contains a quote or backslash. The deploy action parses the flags again with xargs, which would change the pattern. Remove the quote or backslash." ;;
               *) FLAGS="${FLAGS} --exclude=${p}" ;;
             esac
+            if [ "$EXCLUDE_DOCS" = "true" ]; then
+              case "${p#/}" in README.md|CHANGELOG.md|docs|docs/)
+                warn "extra_excludes: '${p}' also shields the server's copy from --delete, so exclude_docs cannot remove it from the install. Remove '${p}' from extra_excludes." ;;
+              esac
+            fi
           done
+          # exclude_docs: hide rules (H), not excludes. A hide rule applies only on
+          # the sending side, so the file is not sent, and on the server --delete
+          # treats it like a file deleted from git. An exclude would also shield
+          # the server's copy, and the file would stay live. `_` separates the rule
+          # from the pattern, so the action's xargs parse sees 1 word. --delete
+          # still runs only inside a target that the rules below allow.
+          if [ "$EXCLUDE_DOCS" = "true" ]; then
+            FLAGS="${FLAGS} --filter=H_/README.md --filter=H_/CHANGELOG.md --filter=H_/docs/"
+          fi
 
           # Parse the flags exactly as the deploy action does, so a check here sees
           # the same argv as rsync. The action uses xargs (utils/functions.sh
@@ -940,6 +988,38 @@ jobs:
           # This line tells it to run strict, against the tree that deploys.
           echo "PREFLIGHT_STAGE=post" >> "$GITHUB_ENV"
 
+      # GitHub masks a secret only where its whole value appears in the log. For
+      # a JSON secret, that leaves the token inside it unmasked: a verbose
+      # Composer run, or a build that prints the parsed auth, would show it. So
+      # this step masks every string in the value before the build can print
+      # one. It reads the value from the environment and stdin, never argv, and
+      # prints no part of it. When the secret is unset, it exits at once.
+      - name: Check COMPOSER_AUTH
+        if: inputs.build_command != ''
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COMPOSER_AUTH" ]; then
+            exit 0
+          fi
+          # -s reads every JSON document on stdin, so 2 concatenated objects fail
+          # here instead of passing as 2 documents.
+          if ! printf '%s' "$COMPOSER_AUTH" | jq -se 'length == 1 and (.[0] | type == "object")' > /dev/null 2>&1; then
+            echo "::error title=COMPOSER_AUTH::The COMPOSER_AUTH secret is set, but it is not 1 JSON object, which is the only form Composer reads. Nothing was built or deployed. Set it to an object such as {\"github-oauth\":{\"github.com\":\"<token>\"}}, or delete the secret."
+            exit 1
+          fi
+          # Every string leaf of 8 or more characters, and each line of a
+          # multi-line one. jq escapes % CR LF as the runner expects, so each value is 1
+          # workflow command, and the runner unescapes it before it masks.
+          printf '%s' "$COMPOSER_AUTH" | jq -r '
+            [.. | strings | ., splits("\r?\n")] | unique[]
+            | select(length >= 8)
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")' |
+            while IFS= read -r v; do
+              echo "::add-mask::${v}"
+            done
+
       - name: Set up Node
         if: inputs.setup_node != ''
         uses: actions/setup-node@v7
@@ -960,7 +1040,16 @@ jobs:
         if: inputs.build_command != ''
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
-        run: bash -euo pipefail -c "$BUILD_COMMAND"
+          SECRET_COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        # Export COMPOSER_AUTH only when the secret is set. An unset secret
+        # arrives as an empty string, and the build then runs with exactly the
+        # environment it had before this secret existed.
+        run: |
+          if [ -n "$SECRET_COMPOSER_AUTH" ]; then
+            export COMPOSER_AUTH="$SECRET_COMPOSER_AUTH"
+          fi
+          unset SECRET_COMPOSER_AUTH
+          exec bash -euo pipefail -c "$BUILD_COMMAND"
 
       # The same step as the preflight job (YAML alias), now against the built
       # tree. It runs on every deploy, with or without a build: it is cheap, and

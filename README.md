@@ -461,6 +461,7 @@ jobs:
 | `php_versions` | No | None | JSON list, for example `["7.4","8.4"]`. Lints once per version. Overrides `php_version` for lint. |
 | `rsync_flags` | No | See [rsync flags](#rsync-flags) | Replaces the whole string when set. |
 | `extra_excludes` | No | None | Space-separated patterns, added as `--exclude=<p>`. Keeps the defaults. |
+| `exclude_docs` | No | `false` | Keeps `README.md`, `CHANGELOG.md` and `docs/` at the top of each target off the install, and **removes** copies already there. See [Keeping docs out of wp-content](#keeping-docs-out-of-wp-content). |
 | `build_command` | No | None | Runs from the repo root before the rsync, for example `composer install --no-dev`. |
 | `setup_node` | No | None | Node version for `build_command`, for example `20`. |
 | `setup_composer` | No | `false` | PHP and Composer for `build_command`. |
@@ -480,6 +481,7 @@ jobs:
 | `WPE_API_PASSWORD` | Secret | `backup: true`, and the install lookup of a dry run | WP Engine API password. |
 | `BACKUP_NOTIFICATION_EMAIL` | **Variable** | `backup: true` | Required by the WP Engine backup endpoint. |
 | `SLACK_WEBHOOK_URL` | Secret | Optional | Posts when a deploy fails, and when a production deploy is cancelled. |
+| `COMPOSER_AUTH` | Secret | Optional, for `build_command` | A JSON object that Composer reads, for a private package. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
 
 `notification_emails` is a *required* field on the WP Engine backup endpoint. So the
 backup job stops with `No backup` when `BACKUP_NOTIFICATION_EMAIL` is not set. A
@@ -637,13 +639,16 @@ examples next to `THEME_NAME`.
 #### A repo whose root is the plugin
 
 Use `./` for this shape. Exclude what must not deploy. A pattern that starts with `/`
-matches only at the top of `src_path`, so a vendored `vendor/foo/README.md` still deploys:
+matches only at the top of `src_path`, so a vendored `vendor/foo/README.md` still deploys.
+`exclude_docs` keeps the docs off the install. See
+[Keeping docs out of wp-content](#keeping-docs-out-of-wp-content).
 
 ```yaml
       src_path: ./
       remote_path: wp-content/plugins/lyh-welcome/
       lint_paths: .
-      extra_excludes: /README.md /CHANGELOG.md /docs/ /tests/ /phpunit.xml.dist
+      exclude_docs: true
+      extra_excludes: /tests/ /phpunit.xml.dist
 ```
 
 #### An mu-plugin
@@ -723,6 +728,93 @@ The build runs in the deploy job, after checkout and before the rsync, so the bu
 is what deploys. Preflight runs again after the build. The lint job lints the source, not
 the build output. `node_modules` and `package.json` are in the default excludes, but
 `vendor/` is not.
+
+#### A build that needs a private package
+
+`composer install` gets a 404 for a package in a **private** repository. The job token
+reaches only the calling repository.
+
+Pass a credential as the optional `COMPOSER_AUTH` secret:
+
+```yaml
+      setup_composer: true
+      build_command: composer install --no-dev --optimize-autoloader
+    secrets: inherit
+```
+
+The secret holds one JSON object. For a package on GitHub:
+
+```json
+{"github-oauth": {"github.com": "<token>"}}
+```
+
+For `<token>`, create a **fine-grained personal access token**:
+
+1. Set the resource owner to the `434marketing` organization.
+2. Under repository access, select only the private package repositories.
+3. Grant `Contents: Read-only`. GitHub adds `Metadata: Read-only` itself.
+4. Set an expiry date. Write the owner's name and the expiry date in the token's
+   description.
+
+The person who creates the token owns it. Before the expiry date, that person creates a
+new token and replaces the secret. An expired token fails the Build step, so nothing
+deploys. If the organization requires approval for fine-grained tokens, an organization
+owner approves it first.
+
+Do not use a GitHub App installation token. It expires after 1 hour. A caller cannot
+mint a new one for each run. A job that calls a reusable workflow has no steps, and
+GitHub drops a job output that holds a secret.
+
+Create the secret on the **site repository** that needs it. An organization secret also
+works, if its access is set to **selected repositories**. With access for all
+repositories, the build of every site repo that passes `secrets: inherit` gets the token.
+
+Set it as a **secret**, not inside `build_command`. The run log shows the command, and
+GitHub masks a secret.
+
+What the deploy job does with it:
+
+- **Unset:** the build runs with no `COMPOSER_AUTH` in its environment, exactly as before.
+- **Set:** before the build, a step checks that the value is one JSON object. Then it
+  masks every string in it of 8 or more characters. GitHub masks only the whole secret,
+  so the bare token inside the JSON would otherwise appear in a log unmasked.
+- **Not one JSON object:** the run fails before the build. The message shows no part of
+  the value. Composer would stop too: it exits 1 on a value it cannot parse.
+
+#### Keeping docs out of wp-content
+
+Everything under `wp-content` is web accessible. A repo whose root is the package, and a
+Composer-installed package, both carry their `README.md`, `CHANGELOG.md` and `docs/` into
+the install, where they are served.
+
+`exclude_docs: true` keeps all three off the install:
+
+```yaml
+      exclude_docs: true
+      # extra_excludes still works alongside it.
+      extra_excludes: /assets/img/source/
+```
+
+It adds 3 hide rules after the other flags: `--filter=H_/README.md`,
+`--filter=H_/CHANGELOG.md` and `--filter=H_/docs/`. A hide rule applies only on the
+sending side. So rsync does not send the file, and `--delete` removes the server's copy,
+as it would for a file deleted from git.
+
+An exclude is different: it also shields the server's copy from `--delete`. So a file
+that deployed once and is excluded later stays on the install, stale and still served.
+
+> [!CAUTION]
+> Files removed from the install. With the default flags, the first deploy with
+> `exclude_docs: true` deletes those 3 paths from each target folder on the server. It
+> defaults to `false`, so each caller decides when that happens.
+
+- The rules match only at the top of each target, so `vendor/foo/README.md` still
+  deploys.
+- `--delete` still acts only inside a target folder that preflight allows. These rules
+  never reach another plugin, or WP Engine's own mu-plugins.
+- Do not also list these paths in `extra_excludes`. An exclude there still shields the
+  server's copy, and preflight warns.
+- Without `--delete` in `rsync_flags`, nothing is removed. Delete the old copies by hand.
 
 #### A plugin with a PHP support floor
 
@@ -893,15 +985,17 @@ To add an exclude, use `extra_excludes`, not a full `rsync_flags`. The defaults 
 as they are:
 
 ```yaml
-      extra_excludes: /README.md /CHANGELOG.md /docs/
+      extra_excludes: /tests/ /phpunit.xml.dist
 ```
 
-- A leading `/` anchors a pattern to the top of `src_path`. Without it, `README.md` would
-  also drop every vendored `vendor/*/README.md`.
+- A leading `/` anchors a pattern to the top of `src_path`. Without it, `tests/` would
+  also drop every vendored `vendor/*/tests/`.
 - An exclude also **shields** the server's copy from `--delete`. The deploy neither
-  updates nor removes an excluded path.
-- Git-ignored files never deploy, whatever the excludes say, because CI deploys a
-  checkout.
+  updates nor removes an excluded path. To remove the docs from the server as well, use
+  `exclude_docs`, which hides them instead.
+- CI deploys a checkout plus what `build_command` writes. Without a build, git-ignored
+  files never deploy. With one, the build output deploys, git-ignored or not, unless an
+  exclude matches it.
 
 #### Dotfiles
 
