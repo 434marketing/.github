@@ -161,6 +161,23 @@ on:
         required: false
         default: ""
         type: string
+      exclude_docs:
+        description: >
+          Keep `README.md`, `CHANGELOG.md` and `docs/` at the top of each
+          target off the install, where everything under wp-content is web
+          accessible. The workflow appends sender-side hide rules
+          (`--filter=H_/README.md --filter=H_/CHANGELOG.md --filter=H_/docs/`),
+          not excludes. An exclude also shields the server's copy from
+          `--delete`, so a file already deployed would stay, stale and served.
+          A hide rule does not, so with `--delete` the next deploy REMOVES the
+          server's copy. `--delete` still acts only inside the target folder
+          that preflight allows. Defaults to false, so a caller decides when
+          that removal happens. Without `--delete` in `rsync_flags`, nothing is
+          removed. Do not also list these files in `extra_excludes`: an exclude
+          there still shields them, and preflight warns.
+        required: false
+        type: boolean
+        default: false
       build_command:
         description: >-
           Shell command that runs from the repo root after checkout and before
@@ -179,6 +196,18 @@ on:
         required: false
         default: false
         type: boolean
+      composer_private_repos:
+        description: >-
+          Private repositories that `build_command` installs a Composer package
+          from, for example "m434-core-wp-plugin". Repository names only,
+          separated by spaces or commas, all under the caller's owner. When the
+          DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets are set, the deploy
+          job mints a GitHub App token that can read only these repositories
+          (Contents: read) and passes it to the build as COMPOSER_AUTH.
+          Required with those secrets, and an error without them.
+        required: false
+        default: ""
+        type: string
       post_deploy_script:
         description: >-
           Path of a script, relative to the site root and inside a deployed
@@ -214,6 +243,37 @@ on:
         default: false
         type: boolean
     secrets:
+      COMPOSER_AUTH:
+        description: >
+          Optional. A JSON object for Composer authentication, for example
+          `{"github-oauth":{"github.com":"<token>"}}`, exported to
+          `build_command` as COMPOSER_AUTH. Needed when `composer install`
+          resolves a package from a PRIVATE repository: the job token reaches
+          only the calling repository. This is the FALLBACK for a repository
+          without the GitHub App secrets below; setting both fails the run. Use
+          a fine-grained personal access token with Contents read-only on the
+          package repositories, an expiry date and a named owner. Before the
+          build, the deploy job checks that the value is 1 JSON object and
+          masks every string in it of 8 or more characters. A value that is
+          not a JSON object fails the run, and the message shows none of it.
+          Unset, the build runs exactly as before, with no COMPOSER_AUTH in its
+          environment.
+        required: false
+      DEPLOY_APP_ID:
+        description: >
+          Optional. The Client ID (or the numeric App ID) of the org-owned
+          GitHub App that reads private Composer packages, from the App's
+          General page. Not the App's name. With
+          DEPLOY_APP_PRIVATE_KEY and `composer_private_repos`, the deploy job
+          mints an installation token for each run, limited to those
+          repositories and to Contents: read, and revoked when the job ends.
+          Set both App secrets or neither.
+        required: false
+      DEPLOY_APP_PRIVATE_KEY:
+        description: >
+          Optional. A private key (.pem) of the same GitHub App. See
+          DEPLOY_APP_ID.
+        required: false
       WPE_SSHG_KEY_PRIVATE:
         description: "Passwordless SSH private key that the WP Engine SSH gateway accepts for this install."
         required: true
@@ -280,6 +340,7 @@ jobs:
           ALLOW_UNSAFE: ${{ inputs.allow_unsafe_remote_path }}
           RSYNC_FLAGS: ${{ inputs.rsync_flags }}
           EXTRA_EXCLUDES: ${{ inputs.extra_excludes }}
+          EXCLUDE_DOCS: ${{ inputs.exclude_docs }}
           LINT_PATHS: ${{ inputs.lint_paths }}
           PHP_VERSION: ${{ inputs.php_version }}
           PHP_VERSIONS: ${{ inputs.php_versions }}
@@ -326,7 +387,21 @@ jobs:
               *[\'\"\\]*) err "extra_excludes: '${p}' contains a quote or backslash. The deploy action parses the flags again with xargs, which would change the pattern. Remove the quote or backslash." ;;
               *) FLAGS="${FLAGS} --exclude=${p}" ;;
             esac
+            if [ "$EXCLUDE_DOCS" = "true" ]; then
+              case "${p#/}" in README.md|CHANGELOG.md|docs|docs/)
+                warn "extra_excludes: '${p}' also shields the server's copy from --delete, so exclude_docs cannot remove it from the install. Remove '${p}' from extra_excludes." ;;
+              esac
+            fi
           done
+          # exclude_docs: hide rules (H), not excludes. A hide rule applies only on
+          # the sending side, so the file is not sent, and on the server --delete
+          # treats it like a file deleted from git. An exclude would also shield
+          # the server's copy, and the file would stay live. `_` separates the rule
+          # from the pattern, so the action's xargs parse sees 1 word. --delete
+          # still runs only inside a target that the rules below allow.
+          if [ "$EXCLUDE_DOCS" = "true" ]; then
+            FLAGS="${FLAGS} --filter=H_/README.md --filter=H_/CHANGELOG.md --filter=H_/docs/"
+          fi
 
           # Parse the flags exactly as the deploy action does, so a check here sees
           # the same argv as rsync. The action uses xargs (utils/functions.sh
@@ -940,6 +1015,80 @@ jobs:
           # This line tells it to run strict, against the tree that deploys.
           echo "PREFLIGHT_STAGE=post" >> "$GITHUB_ENV"
 
+      # Composer credentials come from 1 of 2 sources, never both:
+      #   - the GitHub App: DEPLOY_APP_ID, DEPLOY_APP_PRIVATE_KEY and
+      #     composer_private_repos. The step "Mint a GitHub App token" below
+      #     mints a token for this run only. This is the primary path.
+      #   - COMPOSER_AUTH: a JSON object that the caller stores. The fallback.
+      # This step first refuses an incomplete or ambiguous App setup. It gets
+      # only whether each App secret is set ("true" or "false"), never a value,
+      # and each message is fixed text. With no App secret and no
+      # composer_private_repos, it goes straight to the COMPOSER_AUTH check.
+      #
+      # GitHub masks a secret only where its whole value appears in the log. For
+      # a JSON secret, that leaves the token inside it unmasked: a verbose
+      # Composer run, or a build that prints the parsed auth, would show it. So
+      # this step masks every string in the value before the build can print
+      # one. It reads the value from the environment and stdin, never argv, and
+      # prints no part of it. When the secret is unset, it exits at once.
+      - name: Check COMPOSER_AUTH
+        id: composer
+        if: inputs.build_command != ''
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          HAS_APP_ID: ${{ secrets.DEPLOY_APP_ID != '' }}
+          HAS_APP_KEY: ${{ secrets.DEPLOY_APP_PRIVATE_KEY != '' }}
+          PRIVATE_REPOS: ${{ inputs.composer_private_repos }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_APP_ID" != "$HAS_APP_KEY" ]; then
+            echo "::error title=GitHub App::Only 1 of the 2 secrets DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY reached this run. The App token needs both. Nothing was built or deployed. Give this repository access to both organization secrets, or to neither."
+            exit 1
+          fi
+          if [ "$HAS_APP_ID" = "true" ]; then
+            ERRORS=0
+            if [ -n "$COMPOSER_AUTH" ]; then
+              echo "::error title=Composer credentials::The GitHub App secrets (DEPLOY_APP_ID, DEPLOY_APP_PRIVATE_KEY) and the COMPOSER_AUTH secret are all set. The workflow does not choose between 2 credentials. Nothing was built or deployed. Delete COMPOSER_AUTH to use the App, or remove this repository from the App secrets' access to use COMPOSER_AUTH."
+              ERRORS=1
+            fi
+            # 1 name per line: split on commas and whitespace, drop empties.
+            REPOS="$(printf '%s' "$PRIVATE_REPOS" | tr ',\t\r' '   ' | tr -s ' ' '\n' | grep -v '^$' | sort -u || true)"
+            if [ -z "$REPOS" ]; then
+              echo "::error title=GitHub App::The DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets are set, but the composer_private_repos input is empty, so there is no list of repositories that the token may read. Nothing was built or deployed. Set composer_private_repos to the private package repositories, for example \"m434-core-wp-plugin\"."
+              ERRORS=1
+            elif printf '%s\n' "$REPOS" | grep -qvE '^[A-Za-z0-9._-]+$' || printf '%s\n' "$REPOS" | grep -qxE '\.+'; then
+              echo "::error title=GitHub App::composer_private_repos must list repository names only, separated by spaces or commas, for example \"m434-core-wp-plugin\". Leave out the owner: the token is for the caller's owner. Nothing was built or deployed."
+              ERRORS=1
+            fi
+            [ "$ERRORS" -eq 0 ] || exit 1
+            echo "app=true" >> "$GITHUB_OUTPUT"
+            echo "repos=$(printf '%s\n' "$REPOS" | paste -sd, -)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "${PRIVATE_REPOS//[[:space:],]/}" ]; then
+            echo "::error title=GitHub App::composer_private_repos is set, but the DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets did not reach this run. Nothing was built or deployed. Give this repository access to both organization secrets and pass secrets: inherit, or remove composer_private_repos."
+            exit 1
+          fi
+          if [ -z "$COMPOSER_AUTH" ]; then
+            exit 0
+          fi
+          # -s reads every JSON document on stdin, so 2 concatenated objects fail
+          # here instead of passing as 2 documents.
+          if ! printf '%s' "$COMPOSER_AUTH" | jq -se 'length == 1 and (.[0] | type == "object")' > /dev/null 2>&1; then
+            echo "::error title=COMPOSER_AUTH::The COMPOSER_AUTH secret is set, but it is not 1 JSON object, which is the only form Composer reads. Nothing was built or deployed. Set it to an object such as {\"github-oauth\":{\"github.com\":\"<token>\"}}, or delete the secret."
+            exit 1
+          fi
+          # Every string leaf of 8 or more characters, and each line of a
+          # multi-line one. jq escapes % CR LF as the runner expects, so each value is 1
+          # workflow command, and the runner unescapes it before it masks.
+          printf '%s' "$COMPOSER_AUTH" | jq -r '
+            [.. | strings | ., splits("\r?\n")] | unique[]
+            | select(length >= 8)
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")' |
+            while IFS= read -r v; do
+              echo "::add-mask::${v}"
+            done
+
       - name: Set up Node
         if: inputs.setup_node != ''
         uses: actions/setup-node@v7
@@ -953,6 +1102,28 @@ jobs:
           php-version: ${{ inputs.php_version }}
           tools: composer
 
+      # The App token for Composer. It runs only when "Check COMPOSER_AUTH"
+      # accepted the App setup. The token is minted for this run, for the
+      # caller's owner, can read only the repositories in
+      # composer_private_repos, and has only Contents: read. The action masks
+      # it, and its post step revokes it when the job ends: skip-token-revoke
+      # stays at its default, false. It expires after 1 hour, which is no limit
+      # here, because each run mints its own right before the build.
+      # `client-id` arrived in v3.1.0 and replaces the deprecated `app-id`; it
+      # accepts a Client ID or a numeric App ID. actionlint 1.7.12 still knows
+      # only the older inputs and reports `client-id` as unknown. That report
+      # is wrong for v3.
+      - name: Mint a GitHub App token
+        id: app-token
+        if: steps.composer.outputs.app == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.composer.outputs.repos }}
+          permission-contents: read
+
       # Git-ignored build output (vendor/, build/) is not in a checkout, and
       # --delete removes the server's copy of it. A plugin that needs that
       # output must build here, or must not use --delete.
@@ -960,7 +1131,22 @@ jobs:
         if: inputs.build_command != ''
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
-        run: bash -euo pipefail -c "$BUILD_COMMAND"
+          SECRET_COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        # Export COMPOSER_AUTH only when there is a credential. With the App
+        # token, jq builds the JSON from the environment (env.APP_TOKEN), so the
+        # token is never in argv and nothing prints it. Without the App, an
+        # unset secret arrives as an empty string, and the build then runs with
+        # exactly the environment it had before either credential existed.
+        run: |
+          if [ -n "$APP_TOKEN" ]; then
+            COMPOSER_AUTH="$(jq -cn '{"github-oauth": {"github.com": env.APP_TOKEN}}')"
+            export COMPOSER_AUTH
+          elif [ -n "$SECRET_COMPOSER_AUTH" ]; then
+            export COMPOSER_AUTH="$SECRET_COMPOSER_AUTH"
+          fi
+          unset SECRET_COMPOSER_AUTH APP_TOKEN
+          exec bash -euo pipefail -c "$BUILD_COMMAND"
 
       # The same step as the preflight job (YAML alias), now against the built
       # tree. It runs on every deploy, with or without a build: it is cheap, and

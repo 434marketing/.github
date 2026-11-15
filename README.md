@@ -461,9 +461,11 @@ jobs:
 | `php_versions` | No | None | JSON list, for example `["7.4","8.4"]`. Lints once per version. Overrides `php_version` for lint. |
 | `rsync_flags` | No | See [rsync flags](#rsync-flags) | Replaces the whole string when set. |
 | `extra_excludes` | No | None | Space-separated patterns, added as `--exclude=<p>`. Keeps the defaults. |
+| `exclude_docs` | No | `false` | Keeps `README.md`, `CHANGELOG.md` and `docs/` at the top of each target off the install, and **removes** copies already there. See [Keeping docs out of wp-content](#keeping-docs-out-of-wp-content). |
 | `build_command` | No | None | Runs from the repo root before the rsync, for example `composer install --no-dev`. |
 | `setup_node` | No | None | Node version for `build_command`, for example `20`. |
 | `setup_composer` | No | `false` | PHP and Composer for `build_command`. |
+| `composer_private_repos` | No | None | Private repositories that the App token may read. Names only, under the caller's owner, separated by spaces or commas. Needed with the App secrets. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
 | `post_deploy_script` | No | None | Script on the install, run after the last target. See [Post-deploy checks](#post-deploy-checks). |
 | `smoke_wp_cli` | No | `false` | `wp eval` on the install after the deploy. Any fatal fails the run. |
 | `require_active_plugin` | No | None | Slug that must be active after the deploy. |
@@ -480,6 +482,9 @@ jobs:
 | `WPE_API_PASSWORD` | Secret | `backup: true`, and the install lookup of a dry run | WP Engine API password. |
 | `BACKUP_NOTIFICATION_EMAIL` | **Variable** | `backup: true` | Required by the WP Engine backup endpoint. |
 | `SLACK_WEBHOOK_URL` | Secret | Optional | Posts when a deploy fails, and when a production deploy is cancelled. |
+| `DEPLOY_APP_ID` | Secret | Optional, for a private package | Client ID (starts with `Iv`) or numeric App ID of the organization GitHub App, from its General page. Not the App's name. With `DEPLOY_APP_PRIVATE_KEY` and `composer_private_repos`, the build gets a token minted for the run. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
+| `DEPLOY_APP_PRIVATE_KEY` | Secret | Optional, with `DEPLOY_APP_ID` | Private key of the same App. Set both App secrets or neither. |
+| `COMPOSER_AUTH` | Secret | Optional, for `build_command` | The fallback without the App: a JSON object that Composer reads, for a private package. A run with both this and the App secrets fails. |
 
 `notification_emails` is a *required* field on the WP Engine backup endpoint. So the
 backup job stops with `No backup` when `BACKUP_NOTIFICATION_EMAIL` is not set. A
@@ -637,13 +642,16 @@ examples next to `THEME_NAME`.
 #### A repo whose root is the plugin
 
 Use `./` for this shape. Exclude what must not deploy. A pattern that starts with `/`
-matches only at the top of `src_path`, so a vendored `vendor/foo/README.md` still deploys:
+matches only at the top of `src_path`, so a vendored `vendor/foo/README.md` still deploys.
+`exclude_docs` keeps the docs off the install. See
+[Keeping docs out of wp-content](#keeping-docs-out-of-wp-content).
 
 ```yaml
       src_path: ./
       remote_path: wp-content/plugins/lyh-welcome/
       lint_paths: .
-      extra_excludes: /README.md /CHANGELOG.md /docs/ /tests/ /phpunit.xml.dist
+      exclude_docs: true
+      extra_excludes: /tests/ /phpunit.xml.dist
 ```
 
 #### An mu-plugin
@@ -723,6 +731,162 @@ The build runs in the deploy job, after checkout and before the rsync, so the bu
 is what deploys. Preflight runs again after the build. The lint job lints the source, not
 the build output. `node_modules` and `package.json` are in the default excludes, but
 `vendor/` is not.
+
+#### A build that needs a private package
+
+`composer install` gets a 404 for a package in a **private** repository. The job token
+reaches only the calling repository.
+
+The build gets a credential from one of 2 sources. Use the GitHub App. Use the
+`COMPOSER_AUTH` secret only in a repository that cannot use the App. A run that gets
+both fails.
+
+##### The GitHub App
+
+Pass `composer_private_repos`, and pass `secrets: inherit`:
+
+```yaml
+      setup_composer: true
+      build_command: composer install --no-dev --optimize-autoloader
+      composer_private_repos: m434-core-wp-plugin
+    secrets: inherit
+```
+
+When the secrets `DEPLOY_APP_ID` and `DEPLOY_APP_PRIVATE_KEY` reach the run, the deploy
+job mints a GitHub App installation token right before the build. The token:
+
+- belongs to the caller's owner, and reads only the repositories in
+  `composer_private_repos`.
+- has one permission, `Contents: Read-only`.
+- never shows in the log: the action masks it. The job revokes it when it ends.
+
+The Build step gives the token to `build_command` as `COMPOSER_AUTH`, in the form
+`{"github-oauth":{"github.com":"<token>"}}`. jq builds that value from an environment
+variable, so the token never appears on a command line.
+
+An installation token expires after 1 hour. That is no problem here, because the shared
+workflow mints a new token in each run. The caller never holds the token, so it never
+has to pass one to the shared workflow. No person owns the credential, and nobody
+renews it.
+
+Set up the App once for the organization:
+
+1. Create a GitHub App that the `434marketing` organization owns. Turn off its webhook.
+2. Under repository permissions, grant `Contents: Read-only`. GitHub adds
+   `Metadata: Read-only` itself. Grant nothing else.
+3. Install the App on the organization. Choose **Only select repositories**, and select
+   only the private package repositories, for example `m434-core-wp-plugin`.
+4. Generate a private key.
+5. Create 2 organization secrets. `DEPLOY_APP_ID` holds the App's Client ID, which
+   starts with `Iv`, or its numeric App ID. Both are on the App's General page. It
+   is not the App's name: with the name, the mint step fails with a 401,
+   `Integration must generate a public key`. `DEPLOY_APP_PRIVATE_KEY` holds the
+   whole `.pem` file.
+6. Set the access of both secrets to **selected repositories**. Select the site repos
+   that build with a private package.
+
+Then set `composer_private_repos` in each of those site repos. A new site repo needs
+only step 6 and that input. A new package repository needs only step 3.
+
+The private key does not expire. To rotate it, generate a new key, replace
+`DEPLOY_APP_PRIVATE_KEY`, and then delete the old key in the App settings.
+
+Before the build, the `Check COMPOSER_AUTH` step checks the setup. Each error below stops
+the run before the build, so nothing deploys. No message shows a secret value. The check
+runs in the deploy job, so it runs after the backup.
+
+| Setup | Error |
+|---|---|
+| Only one App secret reaches the run. | `Only 1 of the 2 secrets DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY reached this run.` |
+| Both App secrets, but `composer_private_repos` is empty. | `The DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets are set, but the composer_private_repos input is empty` |
+| Both App secrets, and `COMPOSER_AUTH` too. | `The GitHub App secrets (DEPLOY_APP_ID, DEPLOY_APP_PRIVATE_KEY) and the COMPOSER_AUTH secret are all set.` |
+| `composer_private_repos`, but no App secret. | `composer_private_repos is set, but the DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets did not reach this run.` |
+| `composer_private_repos` holds an owner or a character not allowed in a repository name. | `composer_private_repos must list repository names only` |
+
+If GitHub refuses the token, the `Mint a GitHub App token` step fails, and the build
+does not run. Check that the App has an installation on every repository in
+`composer_private_repos`.
+
+##### The `COMPOSER_AUTH` secret
+
+This is the fallback for a repository without the App secrets. Pass a credential as the
+optional `COMPOSER_AUTH` secret, and leave out `composer_private_repos`:
+
+```yaml
+      setup_composer: true
+      build_command: composer install --no-dev --optimize-autoloader
+    secrets: inherit
+```
+
+The secret holds one JSON object. For a package on GitHub:
+
+```json
+{"github-oauth": {"github.com": "<token>"}}
+```
+
+For `<token>`, create a **fine-grained personal access token**:
+
+1. Set the resource owner to the `434marketing` organization.
+2. Under repository access, select only the private package repositories.
+3. Grant `Contents: Read-only`. GitHub adds `Metadata: Read-only` itself.
+4. Set an expiry date. Write the owner's name and the expiry date in the token's
+   description.
+
+The person who creates the token owns it. Before the expiry date, that person creates a
+new token and replaces the secret. An expired token fails the Build step, so nothing
+deploys. If the organization requires approval for fine-grained tokens, an organization
+owner approves it first. This upkeep is why the App is the primary path.
+
+Create the secret on the **site repository** that needs it. An organization secret also
+works, if its access is set to **selected repositories**. With access for all
+repositories, the build of every site repo that passes `secrets: inherit` gets the token.
+
+Set it as a **secret**, not inside `build_command`. The run log shows the command, and
+GitHub masks a secret.
+
+What the deploy job does with it:
+
+- **Unset:** the build runs with no `COMPOSER_AUTH` in its environment, exactly as before.
+- **Set:** before the build, a step checks that the value is one JSON object. Then it
+  masks every string in it of 8 or more characters. GitHub masks only the whole secret,
+  so the bare token inside the JSON would otherwise appear in a log unmasked.
+- **Not one JSON object:** the run fails before the build. The message shows no part of
+  the value. Composer would stop too: it exits 1 on a value it cannot parse.
+
+#### Keeping docs out of wp-content
+
+Everything under `wp-content` is web accessible. A repo whose root is the package, and a
+Composer-installed package, both carry their `README.md`, `CHANGELOG.md` and `docs/` into
+the install, where they are served.
+
+`exclude_docs: true` keeps all three off the install:
+
+```yaml
+      exclude_docs: true
+      # extra_excludes still works alongside it.
+      extra_excludes: /assets/img/source/
+```
+
+It adds 3 hide rules after the other flags: `--filter=H_/README.md`,
+`--filter=H_/CHANGELOG.md` and `--filter=H_/docs/`. A hide rule applies only on the
+sending side. So rsync does not send the file, and `--delete` removes the server's copy,
+as it would for a file deleted from git.
+
+An exclude is different: it also shields the server's copy from `--delete`. So a file
+that deployed once and is excluded later stays on the install, stale and still served.
+
+> [!CAUTION]
+> Files removed from the install. With the default flags, the first deploy with
+> `exclude_docs: true` deletes those 3 paths from each target folder on the server. It
+> defaults to `false`, so each caller decides when that happens.
+
+- The rules match only at the top of each target, so `vendor/foo/README.md` still
+  deploys.
+- `--delete` still acts only inside a target folder that preflight allows. These rules
+  never reach another plugin, or WP Engine's own mu-plugins.
+- Do not also list these paths in `extra_excludes`. An exclude there still shields the
+  server's copy, and preflight warns.
+- Without `--delete` in `rsync_flags`, nothing is removed. Delete the old copies by hand.
 
 #### A plugin with a PHP support floor
 
@@ -893,15 +1057,17 @@ To add an exclude, use `extra_excludes`, not a full `rsync_flags`. The defaults 
 as they are:
 
 ```yaml
-      extra_excludes: /README.md /CHANGELOG.md /docs/
+      extra_excludes: /tests/ /phpunit.xml.dist
 ```
 
-- A leading `/` anchors a pattern to the top of `src_path`. Without it, `README.md` would
-  also drop every vendored `vendor/*/README.md`.
+- A leading `/` anchors a pattern to the top of `src_path`. Without it, `tests/` would
+  also drop every vendored `vendor/*/tests/`.
 - An exclude also **shields** the server's copy from `--delete`. The deploy neither
-  updates nor removes an excluded path.
-- Git-ignored files never deploy, whatever the excludes say, because CI deploys a
-  checkout.
+  updates nor removes an excluded path. To remove the docs from the server as well, use
+  `exclude_docs`, which hides them instead.
+- CI deploys a checkout plus what `build_command` writes. Without a build, git-ignored
+  files never deploy. With one, the build output deploys, git-ignored or not, unless an
+  exclude matches it.
 
 #### Dotfiles
 
