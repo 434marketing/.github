@@ -465,6 +465,7 @@ jobs:
 | `build_command` | No | None | Runs from the repo root before the rsync, for example `composer install --no-dev`. |
 | `setup_node` | No | None | Node version for `build_command`, for example `20`. |
 | `setup_composer` | No | `false` | PHP and Composer for `build_command`. |
+| `composer_private_repos` | No | None | Private repositories that the App token may read. Names only, under the caller's owner, separated by spaces or commas. Needed with the App secrets. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
 | `post_deploy_script` | No | None | Script on the install, run after the last target. See [Post-deploy checks](#post-deploy-checks). |
 | `smoke_wp_cli` | No | `false` | `wp eval` on the install after the deploy. Any fatal fails the run. |
 | `require_active_plugin` | No | None | Slug that must be active after the deploy. |
@@ -481,7 +482,9 @@ jobs:
 | `WPE_API_PASSWORD` | Secret | `backup: true`, and the install lookup of a dry run | WP Engine API password. |
 | `BACKUP_NOTIFICATION_EMAIL` | **Variable** | `backup: true` | Required by the WP Engine backup endpoint. |
 | `SLACK_WEBHOOK_URL` | Secret | Optional | Posts when a deploy fails, and when a production deploy is cancelled. |
-| `COMPOSER_AUTH` | Secret | Optional, for `build_command` | A JSON object that Composer reads, for a private package. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
+| `DEPLOY_APP_ID` | Secret | Optional, for a private package | Client ID or App ID of the organization GitHub App. With `DEPLOY_APP_PRIVATE_KEY` and `composer_private_repos`, the build gets a token minted for the run. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
+| `DEPLOY_APP_PRIVATE_KEY` | Secret | Optional, with `DEPLOY_APP_ID` | Private key of the same App. Set both App secrets or neither. |
+| `COMPOSER_AUTH` | Secret | Optional, for `build_command` | The fallback without the App: a JSON object that Composer reads, for a private package. A run with both this and the App secrets fails. |
 
 `notification_emails` is a *required* field on the WP Engine backup endpoint. So the
 backup job stops with `No backup` when `BACKUP_NOTIFICATION_EMAIL` is not set. A
@@ -734,7 +737,77 @@ the build output. `node_modules` and `package.json` are in the default excludes,
 `composer install` gets a 404 for a package in a **private** repository. The job token
 reaches only the calling repository.
 
-Pass a credential as the optional `COMPOSER_AUTH` secret:
+The build gets a credential from one of 2 sources. Use the GitHub App. Use the
+`COMPOSER_AUTH` secret only in a repository that cannot use the App. A run that gets
+both fails.
+
+##### The GitHub App
+
+Pass `composer_private_repos`, and pass `secrets: inherit`:
+
+```yaml
+      setup_composer: true
+      build_command: composer install --no-dev --optimize-autoloader
+      composer_private_repos: m434-core-wp-plugin
+    secrets: inherit
+```
+
+When the secrets `DEPLOY_APP_ID` and `DEPLOY_APP_PRIVATE_KEY` reach the run, the deploy
+job mints a GitHub App installation token right before the build. The token:
+
+- belongs to the caller's owner, and reads only the repositories in
+  `composer_private_repos`.
+- has one permission, `Contents: Read-only`.
+- never shows in the log: the action masks it. The job revokes it when it ends.
+
+The Build step gives the token to `build_command` as `COMPOSER_AUTH`, in the form
+`{"github-oauth":{"github.com":"<token>"}}`. jq builds that value from an environment
+variable, so the token never appears on a command line.
+
+An installation token expires after 1 hour. That is no problem here, because the shared
+workflow mints a new token in each run. The caller never holds the token, so it never
+has to pass one to the shared workflow. No person owns the credential, and nobody
+renews it.
+
+Set up the App once for the organization:
+
+1. Create a GitHub App that the `434marketing` organization owns. Turn off its webhook.
+2. Under repository permissions, grant `Contents: Read-only`. GitHub adds
+   `Metadata: Read-only` itself. Grant nothing else.
+3. Install the App on the organization. Choose **Only select repositories**, and select
+   only the private package repositories, for example `m434-core-wp-plugin`.
+4. Generate a private key.
+5. Create 2 organization secrets. `DEPLOY_APP_ID` holds the App's Client ID. The
+   numeric App ID also works. `DEPLOY_APP_PRIVATE_KEY` holds the whole `.pem` file.
+6. Set the access of both secrets to **selected repositories**. Select the site repos
+   that build with a private package.
+
+Then set `composer_private_repos` in each of those site repos. A new site repo needs
+only step 6 and that input. A new package repository needs only step 3.
+
+The private key does not expire. To rotate it, generate a new key, replace
+`DEPLOY_APP_PRIVATE_KEY`, and then delete the old key in the App settings.
+
+Before the build, the `Check COMPOSER_AUTH` step checks the setup. Each error below stops
+the run before the build, so nothing deploys. No message shows a secret value. The check
+runs in the deploy job, so it runs after the backup.
+
+| Setup | Error |
+|---|---|
+| Only one App secret reaches the run. | `Only 1 of the 2 secrets DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY reached this run.` |
+| Both App secrets, but `composer_private_repos` is empty. | `The DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets are set, but the composer_private_repos input is empty` |
+| Both App secrets, and `COMPOSER_AUTH` too. | `The GitHub App secrets (DEPLOY_APP_ID, DEPLOY_APP_PRIVATE_KEY) and the COMPOSER_AUTH secret are all set.` |
+| `composer_private_repos`, but no App secret. | `composer_private_repos is set, but the DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY secrets did not reach this run.` |
+| `composer_private_repos` holds an owner or a character not allowed in a repository name. | `composer_private_repos must list repository names only` |
+
+If GitHub refuses the token, the `Mint a GitHub App token` step fails, and the build
+does not run. Check that the App has an installation on every repository in
+`composer_private_repos`.
+
+##### The `COMPOSER_AUTH` secret
+
+This is the fallback for a repository without the App secrets. Pass a credential as the
+optional `COMPOSER_AUTH` secret, and leave out `composer_private_repos`:
 
 ```yaml
       setup_composer: true
@@ -759,11 +832,7 @@ For `<token>`, create a **fine-grained personal access token**:
 The person who creates the token owns it. Before the expiry date, that person creates a
 new token and replaces the secret. An expired token fails the Build step, so nothing
 deploys. If the organization requires approval for fine-grained tokens, an organization
-owner approves it first.
-
-Do not use a GitHub App installation token. It expires after 1 hour. A caller cannot
-mint a new one for each run. A job that calls a reusable workflow has no steps, and
-GitHub drops a job output that holds a secret.
+owner approves it first. This upkeep is why the App is the primary path.
 
 Create the secret on the **site repository** that needs it. An organization secret also
 works, if its access is set to **selected repositories**. With access for all
