@@ -262,7 +262,8 @@ on:
       DEPLOY_APP_ID:
         description: >
           Optional. The Client ID (or the numeric App ID) of the org-owned
-          GitHub App that reads private Composer packages. With
+          GitHub App that reads private Composer packages, from the App's
+          General page. Not the App's name. With
           DEPLOY_APP_PRIVATE_KEY and `composer_private_repos`, the deploy job
           mints an installation token for each run, limited to those
           repositories and to Contents: read, and revoked when the job ends.

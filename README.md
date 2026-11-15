@@ -482,7 +482,7 @@ jobs:
 | `WPE_API_PASSWORD` | Secret | `backup: true`, and the install lookup of a dry run | WP Engine API password. |
 | `BACKUP_NOTIFICATION_EMAIL` | **Variable** | `backup: true` | Required by the WP Engine backup endpoint. |
 | `SLACK_WEBHOOK_URL` | Secret | Optional | Posts when a deploy fails, and when a production deploy is cancelled. |
-| `DEPLOY_APP_ID` | Secret | Optional, for a private package | Client ID or App ID of the organization GitHub App. With `DEPLOY_APP_PRIVATE_KEY` and `composer_private_repos`, the build gets a token minted for the run. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
+| `DEPLOY_APP_ID` | Secret | Optional, for a private package | Client ID (starts with `Iv`) or numeric App ID of the organization GitHub App, from its General page. Not the App's name. With `DEPLOY_APP_PRIVATE_KEY` and `composer_private_repos`, the build gets a token minted for the run. See [A build that needs a private package](#a-build-that-needs-a-private-package). |
 | `DEPLOY_APP_PRIVATE_KEY` | Secret | Optional, with `DEPLOY_APP_ID` | Private key of the same App. Set both App secrets or neither. |
 | `COMPOSER_AUTH` | Secret | Optional, for `build_command` | The fallback without the App: a JSON object that Composer reads, for a private package. A run with both this and the App secrets fails. |
 
@@ -777,8 +777,11 @@ Set up the App once for the organization:
 3. Install the App on the organization. Choose **Only select repositories**, and select
    only the private package repositories, for example `m434-core-wp-plugin`.
 4. Generate a private key.
-5. Create 2 organization secrets. `DEPLOY_APP_ID` holds the App's Client ID. The
-   numeric App ID also works. `DEPLOY_APP_PRIVATE_KEY` holds the whole `.pem` file.
+5. Create 2 organization secrets. `DEPLOY_APP_ID` holds the App's Client ID, which
+   starts with `Iv`, or its numeric App ID. Both are on the App's General page. It
+   is not the App's name: with the name, the mint step fails with a 401,
+   `Integration must generate a public key`. `DEPLOY_APP_PRIVATE_KEY` holds the
+   whole `.pem` file.
 6. Set the access of both secrets to **selected repositories**. Select the site repos
    that build with a private package.
 
